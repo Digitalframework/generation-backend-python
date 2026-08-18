@@ -1,0 +1,16 @@
+Flask==3.0.3
+requests==2.32.3
+PyJWT==2.9.0
+cryptography==43.0.1
+cachetools==5.5.0
+python-dotenv==1.0.1
+gunicorn==23.0.0
+
+# compositing
+numpy==2.1.1
+opencv-python==4.10.0.84
+pillow==10.4.0
+
+# dev / test
+pytest==8.3.3
+responses==0.25.3

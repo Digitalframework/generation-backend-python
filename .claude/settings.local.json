@@ -1,0 +1,14 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(.venv/Scripts/python.exe -c \"from app import create_app; a=create_app\\(\\); print\\(sorted\\(str\\(r\\) for r in a.url_map.iter_rules\\(\\)\\)\\)\")",
+      "Bash(.venv/Scripts/python.exe -m pytest -q)",
+      "Bash(.venv/Scripts/python.exe scripts/check_balance.py --token \"not.a.real.token\")",
+      "Bash(.venv/Scripts/python.exe -c ' *)",
+      "Bash(.venv/Scripts/python.exe -m pip install -q -r requirements.txt)",
+      "WebSearch",
+      "WebFetch(domain:huggingface.co)",
+      "WebFetch(domain:docs.bfl.ai)"
+    ]
+  }
+}
