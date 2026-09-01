@@ -8,6 +8,8 @@ from config import Config
 from .auth import TokenVerifier
 from .auth_client import AuthServiceClient
 from .errors import AppError
+from .flux import FluxClient
+from .image_client import ImageServiceClient
 
 
 def create_app(config=None):
@@ -17,14 +19,19 @@ def create_app(config=None):
     app.config["MAX_CONTENT_LENGTH"] = config.MAX_UPLOAD_BYTES
     app.extensions["verifier"] = TokenVerifier(config)
     app.extensions["auth_client"] = AuthServiceClient(config)
+    app.extensions["flux"] = FluxClient(config)
+    app.extensions["images"] = ImageServiceClient(config)
 
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s %(levelname)s %(name)s %(message)s",
     )
+
+    from .generate_routes import bp as generate_bp
     from .routes import bp
 
     app.register_blueprint(bp)
+    app.register_blueprint(generate_bp)
     _register_error_handlers(app)
     return app
 

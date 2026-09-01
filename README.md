@@ -122,18 +122,20 @@ elsewhere.
 
 All but `/api/health` need `Authorization: Bearer <token from :8080/api/token>`.
 
-| Method | Path | Description |
+| Method | URL | Description |
 | --- | --- | --- |
-| GET | `/api/health` | Liveness, plus whether the JWKS endpoint answers |
-| GET | `/api/me` | Identity from the token — no network call |
-| GET | `/api/tokens/balance` | The caller's balance |
-| GET | `/api/tokens/check?amount=N` | Whether the caller can afford N |
-| POST | `/api/tokens/spend` | Debit `{"amount": N, "reason": "…"}` |
-| GET | `/api/admin/health` | Example role gate, `ADMIN` only |
-| GET | `/api/generate/quote?references=N` | What a generation with N references would cost |
-| POST | `/api/generate` | FLUX.2 generation from a prompt + N reference images |
-| GET | `/api/compose/quote?objects=N` | What a composite of N objects would cost |
-| POST | `/api/compose` | Place N cutouts into a room photo geometrically |
+| GET | `http://localhost:5000/api/health` | Liveness, plus whether the JWKS endpoint answers |
+| GET | `http://localhost:5000/api/me` | Identity from the token — no network call |
+| GET | `http://localhost:5000/api/tokens/balance` | The caller's balance |
+| GET | `http://localhost:5000/api/tokens/check?amount=1` | Whether the caller can afford N |
+| POST | `http://localhost:5000/api/tokens/spend` | Debit `{"amount": N, "reason": "…"}` |
+| GET | `http://localhost:5000/api/generate/quote?references=0&images=1` | What that generation would cost |
+| POST | `http://localhost:5000/api/generate` | FLUX.2 generation over a composite of catalogue pieces |
+| GET | `http://localhost:5000/api/admin/health` | Example role gate, `ADMIN` only |
+
+Port 5000 is the default and what `docker-compose.yml` publishes. From another
+container on the compose network the host is the service name, `imagegen:5000`;
+from a container outside it, `host.docker.internal:5000`.
 
 ```bash
 TOKEN=$(curl -s -b cookies.txt http://localhost:8080/api/token | jq -r .accessToken)
@@ -149,8 +151,7 @@ calling out.
 
 **Multi-reference is numbered fields, not a list**: `input_image`, then
 `input_image_2` … `input_image_8`. Eight is the API ceiling (the playground
-allows ten, and the local `diffusers` pipeline takes a list of ten — this is not
-that). The prompt addresses them by index or descriptively, and combining both
+allows ten — this is not that). The prompt addresses them by index or descriptively, and combining both
 works best:
 
 ```bash
@@ -243,11 +244,6 @@ farther one and cast onto it.
 Costs `TOKENS_PER_OBJECT` per cutout, checked before the work starts and debited
 only after it succeeds, so a failed composite is free. `GET /api/compose/quote`
 prices a request without doing any of it.
-
-`harmonise` is unchanged and still single-region: with several objects the union
-of their bounding boxes can span most of the frame, at which point the img2img
-pass is re-generating the room rather than blending an edit into it. Harmonising
-each object's own box would be the fix, and it is not done here.
 
 ## Gating expensive work
 

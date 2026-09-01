@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 from dotenv import load_dotenv
 
@@ -51,6 +52,24 @@ class Config:
     # What a composite costs, per reference image placed.
     TOKENS_PER_OBJECT = _int("TOKENS_PER_OBJECT", 1)
 
+    # --- The furniture catalogue, served by generation-backend on :8081 ------
+    # /api/generate fetches each `image_ids` entry from here: the metadata in
+    # one batch call, then the PNG behind each id. The stored width_cm and
+    # height_cm are what let a piece be placed at the right scale from an id.
+    IMAGE_BASE_URL = os.getenv("IMAGE_BASE_URL", "http://localhost:8081").rstrip("/")
+    IMAGE_BATCH_PATH = os.getenv("IMAGE_BATCH_PATH", "/api/images/batch")
+
+    # Separate from HTTP_TIMEOUT: this one pulls PNGs, not small JSON bodies.
+    IMAGE_HTTP_TIMEOUT = _int("IMAGE_HTTP_TIMEOUT", 10)
+
+    # The composite becomes FLUX's "image 1", so the ceiling here is really
+    # MAX_REFERENCES (8) — more pieces than that cannot be referred to.
+    MAX_CATALOGUE_IMAGES = _int("MAX_CATALOGUE_IMAGES", 8)
+
+    # The room a generation is composited into. Rooms are not uploaded anywhere
+    # yet, so this is a file on disk; `scene`/`rooms` on the request override it.
+    ROOM_IMAGE_PATH = Path(os.getenv("ROOM_IMAGE_PATH", "assets/room.png"))
+
     # --- FLUX.2, hosted at Black Forest Labs ---------------------------------
     # Key from https://dashboard.bfl.ai. Without it /api/generate answers 503.
     FLUX_API_KEY = os.getenv("FLUX_API_KEY") or None
@@ -88,6 +107,7 @@ class Config:
 
 class TestConfig(Config):
     AUTH_BASE_URL = "http://auth.test"
+    IMAGE_BASE_URL = "http://images.test"
     JWKS_URI = "http://auth.test/.well-known/jwks.json"
     JWT_ISSUER = "http://auth.test"
     JWT_AUDIENCE = "generation-backend"

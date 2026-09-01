@@ -1,3 +1,6 @@
+# ---------------------------------------------------------------------------
+# Web service
+# ---------------------------------------------------------------------------
 Flask==3.0.3
 requests==2.32.3
 PyJWT==2.9.0
@@ -6,11 +9,38 @@ cachetools==5.5.0
 python-dotenv==1.0.1
 gunicorn==23.0.0
 
-# compositing
-numpy==2.1.1
-opencv-python==4.10.0.84
+# ---------------------------------------------------------------------------
+# Compositing - app/composite.py
+# ---------------------------------------------------------------------------
+# vggt declares numpy<2, so this cannot move to 2.x while vggt is a hard
+# dependency - pip fails to resolve the file at all. 1.26.4 is the last 1.x
+# release and the newest with cp310 wheels.
+numpy==1.26.4
 pillow==10.4.0
+# composite.py no longer imports cv2, but vggt_scene.warp() still does.
+opencv-python==4.10.0.84
+# load_cutout() removes the background of a catalogue image that arrives fully
+# opaque. onnxruntime is rembg's inference backend and is published only as an
+# extra, so the [cpu] marker is load-bearing: plain `rembg` installs no runtime
+# and new_session() fails at call time. Use rembg[gpu] for onnxruntime-gpu.
+# Capped at 2.0.69 by Python 3.10 - rembg 2.0.81+ requires >=3.11.
+rembg[cpu]==2.0.69
 
+# ---------------------------------------------------------------------------
+# Room geometry - app/vggt_scene.py
+#
+# Not optional. compose() takes a SceneGeometry and has no fallback since the
+# hand-measured Geometry was removed. Both imports are lazy, so the service
+# still starts without them and fails only when a generation is attempted.
+#
+# These are CPU wheels. For a CUDA build pick the matching index URL from
+# https://pytorch.org/get-started/locally/ rather than pinning one here.
+# ---------------------------------------------------------------------------
+torch==2.13.0
+vggt @ git+https://github.com/facebookresearch/vggt
+
+# ---------------------------------------------------------------------------
 # dev / test
+# ---------------------------------------------------------------------------
 pytest==8.3.3
 responses==0.25.3
