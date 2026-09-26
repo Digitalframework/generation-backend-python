@@ -1,0 +1,21 @@
+# The venv is Windows-built — copying it into a Linux image breaks pip's view
+# of what is installed.
+.venv/
+.venv-python310-backup/
+__pycache__/
+**/__pycache__/
+*.pyc
+.pytest_cache/
+
+.git/
+.gitignore
+.idea/
+.claude/
+
+# Secrets stay out of the image; pass them with -e or --env-file at run time.
+.env
+
+Dockerfile
+.dockerignore
+docker-compose.yml
+README.md

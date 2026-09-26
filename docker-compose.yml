@@ -1,0 +1,27 @@
+services:
+  imagegen:
+    build:
+      context: .
+      # Pass WITH_ML=0 for a fast, small image without torch/vggt/rembg.
+      args:
+        WITH_ML: "1"
+    image: imagegen-backend:latest
+    ports:
+      - "5000:5000"
+    environment:
+      # AuthAndSecurity (:8080) and the catalogue (:8081) run on the Windows
+      # host, not in this network, so localhost inside the container is wrong.
+      # JWT_ISSUER is deliberately NOT redirected: `iss` is compared to the
+      # string AuthAndSecurity signed into the token, character for character,
+      # so it must stay whatever that service issues.
+      AUTH_BASE_URL: "http://host.docker.internal:8080"
+      JWT_ISSUER: "http://localhost:8080"
+      IMAGE_BASE_URL: "http://host.docker.internal:8081"
+      FLUX_API_KEY: "${FLUX_API_KEY:-}"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # The repo ships assets/ empty. Drop a room.png in there and it appears
+      # at the path config.ROOM_IMAGE_PATH points to.
+      - ./assets:/app/assets:ro
+    restart: unless-stopped
