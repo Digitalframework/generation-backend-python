@@ -18,9 +18,10 @@ images) does the reconstruction instead, and the placement becomes plain 3D:
     2. the depth map is back-projected into camera space and the dominant plane
        under the camera is RANSAC-fitted — that is the floor, as a normal `n`
        and a distance `d` from the camera;
-    3. an object is a rectangle standing *on that plane*, sized in metres,
-       turned to face the camera; its four corners are projected through K and
-       the cutout is warped onto them.
+    3. observed vertical planes provide wall segments and tangents;
+    4. the placement planner chooses a metric baseline and a wall-aligned
+       width axis, checking footprint collisions before projecting through K.
+       Product cutouts are flat rough guides, not reconstructed 3D furniture.
 
 Everything the old code derived from the horizon falls out of the plane: the
 horizon is the plane's vanishing line (l = K^-T n), the floor line under the
@@ -36,8 +37,14 @@ contract does not change. `metres_per_unit = camera_height_m / d`.
 
 Install
 -------
-    pip install torch
-    pip install "vggt @ git+https://github.com/facebookresearch/vggt"
+Windows AMD (RX 9070 / RX 9070 XT): Python 3.12 and a compatible AMD driver:
+    python -m pip install -r requirements-rocm-windows.txt
+
+Other platforms: install requirements.txt with the appropriate PyTorch build.
+ROCm is supplied by AMD's PyTorch/SDK wheels, not a separate VGGT import.
+Both NVIDIA CUDA and AMD ROCm use `import torch` and the `cuda` device name;
+`torch.version.hip` identifies ROCm. Without a supported GPU runtime we use
+CPU (slow). See README.md for setup and verification.
 
 Inference is heavy (1B parameters). The model is loaded once per process and
 solved scenes are cached by image content, so repeated requests against the
@@ -52,6 +59,9 @@ from dataclasses import dataclass, field
 import cv2
 import numpy as np
 from PIL import Image
+
+from .room_dimensions import estimate_room_dimensions
+from .placement_plan import fit_walls
 
 DEFAULT_MODEL = "facebook/VGGT-1B"
 
@@ -79,6 +89,7 @@ _SOLVED_MAX = 8
 # model
 # --------------------------------------------------------------------------- #
 def _resolve_device(device=None):
+    """PyTorch exposes AMD HIP/ROCm through the same cuda API as NVIDIA."""
     import torch
 
     if device:
@@ -99,8 +110,9 @@ def _model(model_id, device):
                 from vggt.models.vggt import VGGT
             except ImportError as exc:
                 raise ImportError(
-                    "VGGT is not installed — `pip install torch` and "
-                    '`pip install "vggt @ git+https://github.com/facebookresearch/vggt"`'
+                    "VGGT or a dependency is unavailable. Install requirements.txt, "
+                    "or requirements-rocm-windows.txt for AMD on Windows "
+                    "with Python 3.12. See README.md."
                 ) from exc
             model = VGGT.from_pretrained(model_id).to(device)
             model.eval()
@@ -141,7 +153,21 @@ def _preprocess(scenes):
     return np.stack(frames), width / small_w, height / small_h
 
 
-def _predict(scenes, model_id, device):
+def _autocast_dtype(device):
+    """Choose precision without treating AMD hardware as NVIDIA hardware."""
+    import torch
+
+    if not device.startswith("cuda"):
+        return torch.float32
+    # AMD's Windows support matrix specifies FP16. Compute-capability
+    # numbers are NVIDIA-specific; ROCm still uses the cuda device API.
+    if torch.version.hip:
+        return torch.float16
+    with torch.cuda.device(device):
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
+def _predict(scenes, model_id, device, all_views=False):
     """Run VGGT once over every view: intrinsics, depth and confidence for frame 0.
 
     Extra views cost inference time and buy accuracy. VGGT attends across the
@@ -155,11 +181,7 @@ def _predict(scenes, model_id, device):
     model = _model(model_id, device)
 
     images = torch.from_numpy(array).permute(0, 3, 1, 2).to(device)  # (S,3,H,W)
-    autocast_dtype = torch.float32
-    if device.startswith("cuda"):
-        autocast_dtype = (
-            torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
-        )
+    autocast_dtype = _autocast_dtype(device)
 
     with torch.no_grad():
         with torch.autocast(
@@ -171,23 +193,35 @@ def _predict(scenes, model_id, device):
 
     from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 
-    # Frame 0: its extrinsic is the identity by construction, so VGGT's world
-    # frame *is* that camera's frame and its depth back-projects straight into
-    # camera coordinates. The other views move the prediction but are never
-    # measured directly - doing that would mean transforming their depth through
-    # their extrinsics first.
-    _extrinsic, intrinsic = pose_encoding_to_extri_intri(
+    extrinsic, intrinsic = pose_encoding_to_extri_intri(
         predictions["pose_enc"], images.shape[-2:]
     )
-    K = intrinsic[0, 0].float().cpu().numpy().astype(np.float64)
-    depth = predictions["depth"][0, 0, ..., 0].float().cpu().numpy()
-    conf = predictions["depth_conf"][0, 0].float().cpu().numpy()
+    intrinsics = intrinsic[0].float().cpu().numpy().astype(np.float64)
+    K = intrinsics[0]
+    depths = predictions["depth"][0, ..., 0].float().cpu().numpy()
+    confidences = predictions["depth_conf"][0].float().cpu().numpy()
+    depth, conf = depths[0], confidences[0]
 
     # K is at VGGT's resolution; stretch it to the photograph's.
     K = K.copy()
     K[0, :] *= sx
     K[1, :] *= sy
+    if all_views:
+        transforms = extrinsic[0].float().cpu().numpy().astype(np.float64)
+        points = _align_views(depths, intrinsics, transforms)
+        return K, depth, conf, (sx, sy), points, confidences
     return K, depth, conf, (sx, sy)
+
+
+def _align_views(depths, intrinsics, extrinsics):
+    """OpenCV world-to-camera extrinsics -> all points in camera 0's frame."""
+    first_rotation, first_translation = extrinsics[0, :3, :3], extrinsics[0, :3, 3]
+    aligned = []
+    for depth, K, transform in zip(depths, intrinsics, extrinsics):
+        camera = _camera_points(depth, K, 1., 1.)
+        world = (camera - transform[:3, 3]) @ transform[:3, :3]
+        aligned.append(world @ first_rotation.T + first_translation)
+    return np.stack(aligned)
 
 
 # --------------------------------------------------------------------------- #
@@ -251,7 +285,7 @@ def _fit_floor(points, conf, seed=0):
     # points pick a poor normal.
     inliers = band[np.abs(band @ best_n + best_d) < tolerance]
     centroid = inliers.mean(0)
-    _u, _s, vt = np.linalg.svd(inliers - centroid)
+    _u, _s, vt = np.linalg.svd(inliers - centroid, full_matrices=False)
     n = vt[-1]
     d = -float(n @ centroid)
 
@@ -293,6 +327,146 @@ def _floor_profile(points, n, d, conf, width, sx):
     return ys, xs_small
 
 
+def _fallback_room_dimensions(all_points, all_conf, normal, distance, camera_height_m,
+                              min_confidence=MIN_CONFIDENCE):
+    """Return a conservative room-size estimate from the aligned multi-view cloud.
+
+    This is intentionally a *fallback*.  The plane-based estimator is preferable
+    when it can identify opposing walls and a ceiling.  Real room photographs often
+    contain furniture/doors/windows that break those planes, though, while the
+    reconstructed cloud still carries enough information for approximate extents.
+    """
+    points = np.asarray(all_points, dtype=np.float64).reshape(-1, 3)
+    conf = np.asarray(all_conf, dtype=np.float64).reshape(-1)
+    keep = (
+        np.isfinite(points).all(axis=1)
+        & np.isfinite(conf)
+        & (conf > min_confidence)
+        & (np.linalg.norm(points, axis=1) > 1e-6)
+    )
+    points = points[keep]
+    if len(points) < 500:
+        return None
+
+    up = np.asarray(normal, dtype=np.float64)
+    up /= np.linalg.norm(up) + 1e-12
+    floor_level = -float(distance)  # dot(point, up) on the fitted floor
+    units_per_metre = float(distance) / float(camera_height_m)
+    if not np.isfinite(units_per_metre) or units_per_metre <= 1e-9:
+        return None
+
+    # Horizontal coordinates in any orthonormal basis of the floor plane.
+    camera_right = np.array([1.0, 0.0, 0.0])
+    e1 = camera_right - float(camera_right @ up) * up
+    if np.linalg.norm(e1) < 1e-6:
+        e1 = np.array([0.0, 0.0, 1.0])
+        e1 -= float(e1 @ up) * up
+    e1 /= np.linalg.norm(e1) + 1e-12
+    e2 = np.cross(up, e1)
+    e2 /= np.linalg.norm(e2) + 1e-12
+
+    h = np.column_stack((points @ e1, points @ e2))
+    vertical = points @ up
+
+    # Remove isolated depth failures before estimating the envelope.
+    radial = np.linalg.norm(h, axis=1)
+    r_lo, r_hi = np.quantile(radial, [0.002, 0.995])
+    envelope_keep = (radial >= r_lo) & (radial <= r_hi)
+    h = h[envelope_keep]
+    vertical = vertical[envelope_keep]
+    if len(h) < 300:
+        return None
+
+    # PCA gives a stable Manhattan-ish floor-plan orientation even when the
+    # camera was not aimed squarely at a wall.  Width is whichever PCA axis is
+    # more aligned with camera-right, matching SceneGeometry's documented rule.
+    centered = h - np.median(h, axis=0)
+    covariance = np.cov(centered, rowvar=False)
+    eigvals, eigvecs = np.linalg.eigh(covariance)
+    order = np.argsort(eigvals)[::-1]
+    axes2 = eigvecs[:, order].T
+    right2 = np.array([1.0, 0.0])
+    width_index = int(np.argmax(np.abs(axes2 @ right2)))
+    length_index = 1 - width_index
+
+    qlo, qhi = 0.01, 0.99
+    projected = centered @ axes2.T
+    spans = np.quantile(projected, qhi, axis=0) - np.quantile(projected, qlo, axis=0)
+    width_m = float(spans[width_index] / units_per_metre)
+    length_m = float(spans[length_index] / units_per_metre)
+
+    # The floor is known accurately.  For the ceiling, use the upper envelope
+    # of confident geometry.  This is less reliable than a fitted ceiling plane
+    # and is therefore explicitly labeled approximate below.
+    above_floor = vertical - floor_level
+    plausible = above_floor[(above_floor > 0) & np.isfinite(above_floor)]
+    height_m = None
+    if len(plausible) >= 200:
+        height_m = float(np.quantile(plausible, 0.995) / units_per_metre)
+
+    def sane(value, low, high):
+        return value if value is not None and np.isfinite(value) and low <= value <= high else None
+
+    # Broad sanity limits only reject catastrophic reconstruction outliers.
+    width_m = sane(width_m, 1.0, 30.0)
+    length_m = sane(length_m, 1.0, 30.0)
+    height_m = sane(height_m, 1.8, 6.0)
+    if width_m is None and length_m is None and height_m is None:
+        return None
+
+    def item(value, what):
+        if value is None:
+            return {
+                "value_m": None,
+                "status": "unavailable",
+                "reason": f"Point-cloud fallback could not obtain a sane {what} estimate.",
+            }
+        return {
+            "value_m": round(value, 2),
+            "status": "estimated",
+            "reason": "Robust 3D point-cloud extent fallback; use as an approximate room-scale value.",
+        }
+
+    return {
+        "width": item(width_m, "width"),
+        "length": item(length_m, "length"),
+        "height": item(height_m, "height"),
+        "method": "multi_view_pointcloud_extent_fallback",
+        "views": int(np.asarray(all_points).shape[0]),
+        "camera_height_m": float(camera_height_m),
+        "assumptions": [
+            "All photos show the same room.",
+            "Scale depends directly on the supplied first-photo camera height.",
+            "Fallback dimensions are robust point-cloud extents, not surveyed wall-to-wall measurements.",
+            "Furniture and incomplete room coverage can bias width/length low or high.",
+            "Width is the estimated room axis most aligned with the first camera's right direction.",
+        ],
+    }
+
+
+def _fill_missing_dimensions(primary, fallback):
+    """Keep strict plane estimates and only fill entries that were unavailable."""
+    if not fallback:
+        return primary
+    result = dict(primary or {})
+    used_fallback = False
+    for key in ("width", "length", "height"):
+        current = result.get(key) or {}
+        if current.get("value_m") is None:
+            candidate = fallback.get(key)
+            if candidate and candidate.get("value_m") is not None:
+                result[key] = candidate
+                used_fallback = True
+    if used_fallback:
+        result["method"] = "multi_view_plane_fitting_with_pointcloud_fallback"
+        result["fallback_method"] = fallback.get("method")
+        result["fallback_note"] = (
+            "Strict wall/ceiling plane fitting was retained where available; missing values "
+            "were filled from robust multi-view point-cloud extents."
+        )
+    return result
+
+
 # --------------------------------------------------------------------------- #
 # the solved scene
 # --------------------------------------------------------------------------- #
@@ -313,6 +487,8 @@ class SceneGeometry:
     floor_v: np.ndarray  # per-column floor/wall junction, length = width
     model: str = DEFAULT_MODEL
     _K_inv: np.ndarray = field(default=None, repr=False)
+    room_dimensions: dict = field(default_factory=dict)
+    walls: list = field(default_factory=list)
 
     def __post_init__(self):
         self._K_inv = np.linalg.inv(self.K)
@@ -373,8 +549,9 @@ class SceneGeometry:
             raise ValueError("an object corner falls behind the camera")
         return p[0] / p[2], p[1] / p[2]
 
-    def object_quad(self, center_x, width_m, height_m, forward_offset_px=0.0):
-        """Corners of an upright, camera-facing rectangle standing on the floor.
+    def object_quad(self, center_x, width_m, height_m, forward_offset_px=0.0,
+                    *, base_m=None, right_axis=None):
+        """Project a wall-oriented upright rectangle through the solved camera.
 
         Returns (quad, px_per_metre) with the quad in TL, TR, BR, BL order, to
         match the corner order of the cutout being warped onto it.
@@ -382,19 +559,23 @@ class SceneGeometry:
         if width_m <= 0 or height_m <= 0:
             raise ValueError("object size must be positive")
 
-        base_y = self.floor_y_at(center_x) + float(forward_offset_px)
-        base = self.floor_point(center_x, base_y)
+        if base_m is not None:
+            base = np.asarray(base_m, dtype=float) * self.units_per_metre
+        else:
+            base_y = self.floor_y_at(center_x) + float(forward_offset_px)
+            base = self.floor_point(center_x, base_y)
 
         up = self.normal
-        # The object faces the camera: its width axis is horizontal, lies in the
-        # floor plane, and is perpendicular to the line of sight to its base.
-        sight = base / (np.linalg.norm(base) + 1e-12)
-        sight = sight - (sight @ up) * up
-        norm = np.linalg.norm(sight)
-        if norm < 1e-6:
-            raise ValueError("the object stands directly below the camera")
-        sight /= norm
-        right = np.cross(sight, up)
+        if right_axis is None:
+            if not self.walls:
+                raise ValueError("no wall orientation available for this placement")
+            nearest = min(self.walls, key=lambda wall: abs(
+                (base / self.units_per_metre - wall.origin) @ wall.inward))
+            right_axis = nearest.right
+        right = np.asarray(right_axis, dtype=float)
+        right = right - (right @ up) * up
+        if not np.isfinite(right).all() or np.linalg.norm(right) < 1e-6:
+            raise ValueError("invalid wall tangent")
         right /= np.linalg.norm(right)
 
         upm = self.units_per_metre
@@ -402,22 +583,24 @@ class SceneGeometry:
         rise = up * height_m * upm
 
         bl, br = base - half, base + half
-        if self._project(br)[0] < self._project(bl)[0]:  # keep image-left left
-            bl, br = br, bl
         corners = [bl + rise, br + rise, br, bl]  # TL, TR, BR, BL
         quad = np.float32([self._project(c) for c in corners])
+        if abs(cv2.contourArea(quad)) < 1:
+            raise ValueError("wall-oriented object is edge-on to the camera")
 
         left_px = float(np.linalg.norm(quad[0] - quad[3]))
         right_px = float(np.linalg.norm(quad[1] - quad[2]))
         return quad, (left_px + right_px) / 2.0 / height_m
 
-    def warp(self, cutout, canvas_size, center_x, width_m, height_m, forward_offset_px=0.0):
+    def warp(self, cutout, canvas_size, center_x, width_m, height_m, forward_offset_px=0.0,
+             *, base_m=None, right_axis=None):
         """Cutout warped onto its place in the room. Successor to `keystone_fit`.
 
         A homography is exact here: the cutout is a flat billboard, and the
         quad is the projection of the plane it stands in.
         """
-        quad, ppm = self.object_quad(center_x, width_m, height_m, forward_offset_px)
+        quad, ppm = self.object_quad(center_x, width_m, height_m, forward_offset_px,
+                                    base_m=base_m, right_axis=right_axis)
         src = np.float32(
             [[0, 0], [cutout.width, 0], [cutout.width, cutout.height], [0, cutout.height]]
         )
@@ -468,10 +651,11 @@ def solve_scene(scene, camera_height_m=1.10, model=DEFAULT_MODEL, device=None, v
         raise ValueError("give at least one room photograph")
     scenes = [s if isinstance(s, Image.Image) else _open(s) for s in scenes]
     scene = scenes[0]
-    if camera_height_m <= 0:
-        raise ValueError("camera_height_m must be positive")
+    if not np.isfinite(camera_height_m) or camera_height_m <= 0:
+        raise ValueError("camera_height_m must be finite and positive")
 
-    key = _cache_key(scenes, model)
+    # Room dimensions are metric, unlike the cached floor's model units.
+    key = (_cache_key(scenes, model), float(camera_height_m))
     with _SOLVED_LOCK:
         solved = _SOLVED.get(key)
         if solved is not None:
@@ -479,29 +663,41 @@ def solve_scene(scene, camera_height_m=1.10, model=DEFAULT_MODEL, device=None, v
 
     if solved is None:
         device = _resolve_device(device)
-        K, depth, conf, (sx, sy) = _predict(scenes, model, device)
+        K, depth, conf, (sx, sy), all_points, all_conf = _predict(
+            scenes, model, device, all_views=True
+        )
         points = _camera_points(depth, K, sx, sy)
         normal, distance = _fit_floor(points, conf)
+        dimensions = estimate_room_dimensions(
+            all_points, all_conf, normal, distance, camera_height_m,
+            min_confidence=MIN_CONFIDENCE,
+        )
+        fallback_dimensions = _fallback_room_dimensions(
+            all_points, all_conf, normal, distance, camera_height_m,
+            min_confidence=MIN_CONFIDENCE,
+        )
+        dimensions = _fill_missing_dimensions(dimensions, fallback_dimensions)
 
         rows_small = points.shape[0]
         first, xs_small = _floor_profile(points, normal, distance, conf, scene.width, sx)
         # `first` came back in VGGT rows; scale it to the photograph's rows.
         floor_v = first * sy
         floor_v = np.clip(floor_v, 0, scene.height - 1)
-        solved = (K, normal, distance, floor_v)
+        walls = fit_walls(all_points, all_conf, normal, camera_height_m,
+                          distance / camera_height_m, MIN_CONFIDENCE)
+        solved = (K, normal, distance, floor_v, dimensions, walls)
         with _SOLVED_LOCK:
             _SOLVED[key] = solved
             while len(_SOLVED) > _SOLVED_MAX:
                 _SOLVED.popitem(last=False)
         if verbose:
             print(
-                f"vggt: f={K[0, 0]:.0f}px horizon_y="
-                f"{-(np.linalg.inv(K).T @ normal)[0] * 0 or 0:.0f} "
+                f"vggt: f={K[0, 0]:.0f}px "
                 f"floor rows {floor_v.min():.0f}-{floor_v.max():.0f} "
                 f"({rows_small} depth rows)"
             )
 
-    K, normal, distance, floor_v = solved
+    K, normal, distance, floor_v, dimensions, walls = solved
     geometry = SceneGeometry(
         K=K,
         normal=normal,
@@ -510,6 +706,8 @@ def solve_scene(scene, camera_height_m=1.10, model=DEFAULT_MODEL, device=None, v
         size=scene.size,
         floor_v=floor_v,
         model=model,
+        room_dimensions=dimensions,
+        walls=walls,
     )
     if verbose:
         print(

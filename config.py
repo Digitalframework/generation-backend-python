@@ -69,6 +69,11 @@ class Config:
     # The room a generation is composited into. Rooms are not uploaded anywhere
     # yet, so this is a file on disk; `scene`/`rooms` on the request override it.
     ROOM_IMAGE_PATH = Path(os.getenv("ROOM_IMAGE_PATH", "assets/room.png"))
+    # Reconstruct room dimensions for the FLUX prompt, even while furniture
+    # compositing is bypassed. Set 0 to run the API without local ML inference.
+    ROOM_GEOMETRY_ENABLED = os.getenv("ROOM_GEOMETRY_ENABLED", "1").lower() in ("1", "true", "yes")
+    PERSON_HEIGHT_M = _float("PERSON_HEIGHT_M", 1.75)
+    CHEST_HEIGHT_RATIO = _float("CHEST_HEIGHT_RATIO", 0.73)
 
     # --- FLUX.2, hosted at Black Forest Labs ---------------------------------
     # Key from https://dashboard.bfl.ai. Without it /api/generate answers 503.

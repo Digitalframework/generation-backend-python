@@ -6,7 +6,9 @@ v4 changes:
     keystone warp derived from it are gone. `app/vggt_scene.py` reconstructs the
     room instead: VGGT predicts intrinsics and depth, the floor is RANSAC-fitted
     as a plane, and an object is a rectangle standing on that plane. Placement
-    is plain 3D projection rather than a horizon proxy.
+    is plain 3D projection rather than a horizon proxy. Generation now uses
+    wall-aligned metric transforms from placement_plan.py; product photos
+    remain flat guides, so this is not a full volumetric furniture renderer.
   - depth ordering uses true camera-space distance (`SceneGeometry.depth_m`)
     instead of base y in pixels, which is monotonic in depth only for a level
     camera.
@@ -61,6 +63,11 @@ class Placement:
     shadow_ambient: float = 0.0  # wide soft pool
     glossy_floor: bool = False  # faint vertical reflection
     label: str = ""  # for error messages only
+    depth_size_m: float = None  # full physical footprint, including chaise
+    base_m: np.ndarray = None  # planned front baseline in camera-frame metres
+    right_axis: np.ndarray = None  # chosen wall tangent
+    wall_id: str = None
+    mount_height_m: float = 0.0
 
     @property
     def casts_shadow(self):
@@ -68,6 +75,8 @@ class Placement:
 
     def depth_m(self, geometry):
         """Distance from the camera to where this object stands, for sorting."""
+        if self.base_m is not None:
+            return float(np.linalg.norm(self.base_m))
         return geometry.depth_m(self.center_x, self.forward_offset_px)
 
 
@@ -76,6 +85,7 @@ class CompositeResult:
     image: Image.Image  # RGB composite
     mask: Image.Image  # L, union of every object and its shadow
     scale: list = field(default_factory=list)  # px/m per placement, for logging
+    placement_plan: list = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -207,6 +217,8 @@ def compose(scene, placements, geometry, verbose=False):
     ordered = sorted(placements, key=lambda p: p.depth_m(geometry), reverse=True)
 
     for item in ordered:
+        transform = ({"base_m": item.base_m, "right_axis": item.right_axis}
+                     if item.base_m is not None else {})
         warped, ppm = geometry.warp(
             item.image,
             scene.size,
@@ -214,6 +226,7 @@ def compose(scene, placements, geometry, verbose=False):
             item.width_m,
             item.height_m,
             item.forward_offset_px,
+            **transform,
         )
         scales.append(ppm)
         if verbose:
@@ -223,13 +236,13 @@ def compose(scene, placements, geometry, verbose=False):
             )
 
         shadow = None
-        if item.casts_shadow:
+        if item.casts_shadow and item.mount_height_m == 0:
             shadow = floor_shadow(
                 scene.size, warped, item.light_from, item.shadow_core, item.shadow_ambient
             )
             comp = _apply_shadow(comp, shadow)
 
-        if item.glossy_floor:
+        if item.glossy_floor and item.mount_height_m == 0:
             refl = floor_reflection(scene.size, warped)
             if refl is not None:
                 comp = Image.alpha_composite(comp.convert("RGBA"), refl).convert("RGB")
@@ -243,7 +256,12 @@ def compose(scene, placements, geometry, verbose=False):
             layer = np.maximum(layer, np.array(shadow))
         mask = Image.fromarray(np.maximum(np.array(mask), layer))
 
-    return CompositeResult(image=comp, mask=mask, scale=scales)
+    plan = [{"index": index, "label": item.label, "wall_id": item.wall_id,
+             "base_m": item.base_m.tolist(), "right_axis": item.right_axis.tolist(),
+             "width_m": item.width_m, "height_m": item.height_m,
+             "depth_m": item.depth_size_m, "mount_height_m": item.mount_height_m}
+            for index, item in enumerate(placements) if item.base_m is not None]
+    return CompositeResult(image=comp, mask=mask, scale=scales, placement_plan=plan)
 
 
 # --------------------------------------------------------------------------- #

@@ -1,4 +1,5 @@
 .venv/
+.venv-python310-backup/
 __pycache__/
 *.pyc
 .env

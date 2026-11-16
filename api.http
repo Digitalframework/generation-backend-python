@@ -1,0 +1,87 @@
+# ---------------------------------------------------------------------------
+# Every endpoint, callable without a terminal.
+#
+#   VS Code    install the "REST Client" extension (humao.rest-client), then
+#              click the "Send Request" link above any request below.
+#   PyCharm /  built in. Click the green arrow in the gutter.
+#   IntelliJ
+#
+# The token: open http://localhost:8080/api/token in a browser tab where you
+# are signed in, copy `accessToken` out of the JSON, and paste it below. It is
+# good for 15 minutes; when calls start answering 401 with "expired", reload
+# that tab and paste a fresh one.
+#
+# The session cookie is what authenticates that browser tab, which is why the
+# token is fetched there rather than here — this client has no session.
+# ---------------------------------------------------------------------------
+
+@host = http://localhost:5000
+@token = PASTE_THE_ACCESS_TOKEN_HERE
+
+
+### health — the only endpoint needing no token
+GET {{host}}/api/health
+
+
+### me — identity straight off the token, no network call
+GET {{host}}/api/me
+Authorization: Bearer {{token}}
+
+
+### balance
+GET {{host}}/api/tokens/balance
+Authorization: Bearer {{token}}
+
+
+### check — can the caller afford 1 token?
+GET {{host}}/api/tokens/check?amount=1
+Authorization: Bearer {{token}}
+
+
+### spend — debits, so it changes state
+POST {{host}}/api/tokens/spend
+Authorization: Bearer {{token}}
+Content-Type: application/json
+
+{
+  "amount": 1,
+  "reason": "manual test"
+}
+
+
+### quote — prices a generation without running it
+GET {{host}}/api/generate/quote?references=0&images=1
+Authorization: Bearer {{token}}
+
+
+### admin health — 403 unless the token carries the ADMIN role
+GET {{host}}/api/admin/health
+Authorization: Bearer {{token}}
+
+
+### generate — multipart; needs catalogue ids on :8081 and a room photo.
+# `rooms` is optional: without it the service falls back to the file at
+# ROOM_IMAGE_PATH (assets/room.png), which the repo ships empty, so a request
+# with neither answers 503 room_unavailable.
+POST {{host}}/api/generate
+Authorization: Bearer {{token}}
+Content-Type: multipart/form-data; boundary=----boundary
+
+------boundary
+Content-Disposition: form-data; name="prompt"
+
+a modern living room, photorealistic interior
+------boundary
+Content-Disposition: form-data; name="image_ids"
+
+3,7
+------boundary
+Content-Disposition: form-data; name="user_height"
+
+1.70
+------boundary
+Content-Disposition: form-data; name="rooms"; filename="room1.png"
+Content-Type: image/png
+
+< ./assets/room1.png
+------boundary--

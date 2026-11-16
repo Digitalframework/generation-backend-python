@@ -25,17 +25,21 @@ WHAT THIS MODULE DOES NOT DO
 import re
 from dataclasses import dataclass, field
 
-# The standing directives sent with every request. Kept short on purpose:
-# FLUX.2's text encoder truncates at 512 tokens, so this covers only what the
-# model alone decides - how the pieces are lit, how they meet the floor, and
-# whether they stay the product they came from. Placement and scale are
-# already settled by the composite, and saying so again invites it to move
-# things.
+# The standing directives sent with every request. Kept short on purpose: a
+# long prompt dilutes every line in it, so this covers only what the model
+# alone decides - how the pieces are lit, how they meet the floor, where they
+# may stand, and whether they stay the product they came from.
+#
+# The 512-token ceiling this was originally written against is FLUX.1's, from
+# its T5 encoder. FLUX.2 encodes with a Mistral-3 VLM and takes far longer
+# prompts, so length is a quality question here, not a truncation one.
 ESSENTIALS = """The room is fixed. Keep the walls, floor, ceiling, windows, blinds, molding, baseboards, outlets, vents and doors exactly as photographed, and keep the camera position, height, angle and framing unchanged.
 
 Light every inserted piece with the room's own light. Preserve the existing daylight direction, window illumination, blind shadows, shadow softness, colour temperature and exposure. The side of each piece facing the window is brighter and the opposite side falls into shadow; every new shadow runs in the same direction, and with the same softness, as the shadows already in the room. Add no studio lighting, no rim light and no cinematic grading, and do not change the time of day.
 
-Every piece rests on the floor and touches it. Each needs a contact shadow beneath its base, ambient occlusion where it meets the floor and walls, and correct occlusion where pieces overlap. Nothing floats, nothing looks pasted on, and no outline, halo or cut-out edge surrounds any object.
+Floor-standing pieces rest on the floor and touch it. Wall-mounted pieces attach to their assigned wall at the planned elevation. Use contact shadows and ambient occlusion at the appropriate floor or wall attachments, and correct occlusion where pieces overlap. Nothing looks pasted on, and no outline, halo or cut-out edge surrounds any object.
+
+Keep clear walking paths and do not obstruct any doorway or patio door. Every door must still be able to open, and the route between them must stay walkable. Place each piece at correct room-scale perspective, sized against the room it stands in and integrated naturally into it rather than arranged for the camera.
 
 Reproduce each product exactly as its reference shows it and keep its supplied dimensions. Do not substitute a similar piece, redesign it, or change its colour, material or finish to suit the room.
 
@@ -150,7 +154,7 @@ TYPES = {
         FurnitureType(
             slug="sideboard",
             label="sideboard",
-            aliases=("sideboard", "credenza", "buffet", "anrichte", "highboard", "lowboard"),
+            aliases=("sideboard", "credenza", "buffet", "anrichte", "highboard"),
             attributes=(
                 "Overall width, height and depth",
                 "Number of doors",
@@ -313,9 +317,11 @@ TYPES = {
             generic="generic open bookcase",
         ),
         FurnitureType(
-            slug="tv_unit",
-            label="TV unit",
-            aliases=("tv unit", "tv stand", "media console", "tv-board", "tv board", "lowboard tv"),
+            slug="lowboard",
+            label="lowboard",
+            # A lowboard is not a sideboard: it is the low media cabinet, and
+            # the English "TV unit" names the same piece, so both land here.
+            aliases=("lowboard", "tv unit", "tv stand", "media console", "tv-board", "tv board"),
             attributes=(
                 "Overall width, height and depth",
                 "Number of doors, drawers and open compartments",
@@ -327,7 +333,7 @@ TYPES = {
                 "Leg shape, material and colour",
                 "Carcass material and finish",
             ),
-            generic="generic black TV stand",
+            generic="generic black lowboard",
         ),
         FurnitureType(
             slug="floor_lamp",
@@ -492,13 +498,36 @@ _ALIAS_INDEX = sorted(
 )
 
 
-def resolve_type(explicit=None, metadata=None, name=None):
+def _haystacks(*parts):
+    """Lowercased text to keyword-match, in a spaced and a squashed form.
+
+    The squashed form is what lets `coffeetable_2` match the alias "coffee
+    table": a filename drops the space the alias carries, so matching only the
+    spaced form misses every compounded name.
+    """
+    text = " ".join(str(part) for part in parts if part).lower()
+    spaced = re.sub(r"[^a-z0-9äöüß]+", " ", text).strip()
+    return spaced, spaced.replace(" ", "")
+
+
+def _stem(filename):
+    """`armchair_2.jpg` -> `armchair_2`, so the extension cannot match an alias."""
+    if not filename:
+        return ""
+    return str(filename).rsplit("/", 1)[-1].rsplit(".", 1)[0]
+
+
+def resolve_type(explicit=None, metadata=None, name=None, filename=None):
     """Pick the furniture type, most trustworthy source first.
 
     An explicit slug on the placement beats the catalogue, which beats guessing
     from the product name. An unrecognised explicit slug is an error worth
     raising rather than silently falling back, since it means the caller asked
     for a checklist that does not exist.
+
+    The filename is matched too, and last. A catalogue that stores no `type`
+    and an autogenerated `name` often still has a hand-named file - sofa_1.jpg,
+    highboard_2.jpg - and that is the only furniture word in the row.
     """
     if explicit:
         slug = _slugify(explicit)
@@ -515,9 +544,11 @@ def resolve_type(explicit=None, metadata=None, name=None):
             if slug in TYPES:
                 return TYPES[slug]
 
-    haystack = " ".join(part for part in (name, (metadata or {}).get("name")) if part).lower()
+    metadata = metadata or {}
+    filename = filename or metadata.get("filename") or metadata.get("fileName")
+    spaced, squashed = _haystacks(name, metadata.get("name"), _stem(filename))
     for alias, furniture_type in _ALIAS_INDEX:
-        if alias in haystack:
+        if alias in spaced or alias.replace(" ", "") in squashed:
             return furniture_type
     return GENERIC_TYPE
 
@@ -570,7 +601,7 @@ class Reference:
             where += f" (image {self.image_index})"
 
         lines = [
-            f"If {where} is the {kind} reference:",
+            f"Use {where} as the exact {kind} reference:",
             "",
             f"Identify it as a specific {kind} object.",
             "",
@@ -648,13 +679,33 @@ def room_metrics(geometry):
 
 
 def room_block(geometry, scene_name="room.png"):
-    """The measured-room section, or a note that the room was not measured."""
+    """Use supported plane estimates as approximate scale context for FLUX."""
     if geometry is None:
         return (
             f"No measured dimensions are available for `{scene_name}`. Read the "
             "room's scale from the architecture visible in the image and from the "
             "supplied furniture dimensions."
         )
+
+    dimensions = getattr(geometry, "room_dimensions", {})
+    if dimensions:
+        lines = [f"Approximate room dimensions for `{scene_name}`:"]
+        for key in ("width", "length", "height"):
+            estimate = dimensions.get(key, {})
+            value = estimate.get("value_m")
+            if estimate.get("status") == "estimated" and value is not None:
+                lines.append(f"* {key.capitalize()}: approximately {value:.1f} m")
+            else:
+                lines.append(f"* {key.capitalize()}: unknown from the supplied views")
+        lines += [
+            f"Scale reference: camera height {geometry.camera_height_m:.2f} m.",
+            "Width is the room axis most aligned with camera-right; length is perpendicular.",
+            "These are geometric estimates, not surveyed measurements. Use them only "
+            "as approximate furniture-scale context. Preserve the architecture and "
+            "camera viewpoint in the main room photo. Supplied furniture dimensions "
+            "remain authoritative. Unknown room dimensions stay unspecified.",
+        ]
+        return "\n".join(lines)
 
     try:
         metrics = room_metrics(geometry)
@@ -668,7 +719,7 @@ def room_block(geometry, scene_name="room.png"):
 
     return "\n".join(
         [
-            f"`{scene_name}` has been reconstructed in 3D. Its measured dimensions are:",
+            f"`{scene_name}` has been reconstructed in 3D. Approximate visible floor extents:",
             "",
             f"* Width along the far wall: {metrics['back_wall_width_m']:.2f} m",
             f"* Distance from the camera to the far wall: {metrics['depth_to_back_wall_m']:.2f} m",
@@ -778,9 +829,10 @@ def reference_from_catalogue(metadata, spec=None, image_index=None, filename=Non
         return value if value > 0 else None
 
     name = spec.get("name") or metadata.get("name") or ""
+    filename = filename or _filename_for(metadata)
     return Reference(
-        filename=filename or _filename_for(metadata),
-        furniture_type=resolve_type(spec.get("type"), metadata, name),
+        filename=filename,
+        furniture_type=resolve_type(spec.get("type"), metadata, name, filename),
         name=name,
         width_cm=_cm("width_m", "width_cm", "widthCm"),
         height_cm=_cm("height_m", "height_cm", "heightCm"),

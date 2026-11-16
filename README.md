@@ -5,6 +5,43 @@ the caller's token balance before doing paid work.
 
 ## How it fits together
 
+### Local AMD GPU setup (Windows)
+
+VGGT room reconstruction supports AMD ROCm through PyTorch's existing
+`torch.cuda` interface; no `import rocm` or separate VGGT backend is needed.
+The Windows setup uses Python **3.12**, PyTorch **2.9.1 + ROCm 7.2.1**,
+and matching torchvision/ROCm SDK wheels. RX 9070 and RX 9070 XT are supported.
+AMD specifies Windows 11 and the compatible 26.2.2 graphics driver for this
+release. See the [AMD installation guide](https://rocm.docs.amd.com/projects/radeon-ryzen/en/docs-7.2.1/docs/install/installrad/windows/install-pytorch.html).
+
+For a fresh environment (preserve an existing Python 3.10 environment first):
+
+```powershell
+py -3.12 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements-rocm-windows.txt
+.\.venv\Scripts\python.exe -m pip check
+.\.venv\Scripts\python.exe -c "import torch; print(torch.__version__, torch.version.hip); assert torch.cuda.is_available(); print(torch.cuda.get_device_name(0))"
+```
+
+Always use `requirements-rocm-windows.txt` when reinstalling this AMD setup;
+the generic requirements alone do not install AMD's Windows runtime. The
+ROCm requirements are Windows/Python 3.12 only; Linux/NVIDIA deployments use
+their platform-appropriate PyTorch build. Background removal remains on CPU.
+
+`app/vggt_scene.py` selects `cuda` for AMD or NVIDIA and falls back to CPU
+when GPU support is unavailable. AMD uses FP16 autocast; NVIDIA uses BF16
+when supported, otherwise FP16. Model weights download on first inference.
+Test scene reconstruction directly with an actual room photo:
+
+```powershell
+.\.venv\Scripts\python.exe -c "from app.vggt_scene import solve_scene; solve_scene('assets/room.png', device='cuda', verbose=True)"
+```
+
+The generation route currently bypasses VGGT/compositing for testing in
+`app/generate_routes.py`; installing ROCm does not remove that bypass.
+
+### Service connections
+
 ```
 browser --- session cookie ---> AuthAndSecurity  (:8080)   signs RS256 tokens,
    |                                  |                     owns app_user.token_balance
@@ -261,6 +298,69 @@ def generate():
 through `spend`, which is where the atomic decrement lives. Whether to charge
 before or after the model runs is a real decision — charging first loses the
 user's tokens on a model failure, charging after gives away work on a crash.
+
+## Wall-based generation placement
+
+FLUX receives image 1 as the rough room/layout guide, followed by the original
+catalogue product photos in `image_ids` order (images 2 onward), followed by
+optional uploaded `references`. The prompt explicitly maps each product to its
+image number and treats the originals as the authority for product design.
+The flat cutouts guide placement rather than defining the product's silhouette.
+All transmitted images count toward reference pricing and the configured limit
+of eight: one composite plus products plus uploads. Requests exceeding that limit
+are rejected instead of dropping product references. `/generate/quote` treats
+`references` as uploaded extras and returns `totalReferences` including products
+and the composite.
+
+`/api/generate` now follows VGGT camera/depth -> fitted floor and wall planes ->
+metric furniture transforms -> warped rough composite -> FLUX. Objects follow
+the chosen wall tangent instead of facing the camera. Automatic screen-column
+spacing has been removed from generation.
+
+Send `placements` in catalogue-id order. Width, height and **full footprint
+depth** default to `widthCm`, `heightCm`, `depthCm`. For an L sofa, depth must
+include the extended chaise; the planner currently uses a conservative rectangular
+bounding footprint, not an L-shaped footprint. Missing depth blocks placement.
+
+```json
+[{"wall_id":"wall_1","wall_offset_m":0.0,"wall_gap_m":0.05,
+  "width_m":3.0,"height_m":0.3,"depth_m":0.31,"mount_height_m":0.4}]
+```
+
+`wall_offset_m` is the signed distance along the returned wall's `right_axis`
+from its `origin_m`. Default wall gap is 5 cm. `mount_height_m` is the bottom
+edge's height above the floor (default 0). Generation rejects legacy `center_x`
+and `forward_offset_px`; these cannot express a physical wall placement.
+
+Both generation endpoints accept `user_height` as a **Text** multipart field in
+metres, e.g. `1.70`. The estimated camera height passed to VGGT is
+`user_height * CHEST_HEIGHT_RATIO` (default ratio `0.73`): 1.70 m gives 1.241 m.
+This assumes the first room photo was taken with the camera at chest height;
+it is a scale estimate, not a camera height measured by VGGT. Omitted height
+uses `PERSON_HEIGHT_M` (default `1.75`, giving 1.2775 m). Both defaults are
+environment settings. Do not send `geometry.camera_height_m`; the generation
+endpoints reject the old geometry field. Internal VGGT geometry still uses
+the calculated camera height in metres.
+
+`POST /api/generate/plan` accepts the same room uploads, user height, image ids and
+placements as generation, without requiring a prompt. It returns supported walls
+and planned transforms, without calling FLUX or debiting tokens. Both endpoints
+return HTTP 422 `placement_conflict` with `details.issues` if a product cannot be
+placed by the planner. The frontend can then offer another wall, corrected
+measurements/views, or exclusion from this generation. Exclusion means removing
+that id from the next request, not deleting its catalogue record. No item is
+silently removed or resized. Planning is deterministic for the same reconstruction
+and inputs; this endpoint does not save an approved plan or implement a UI dialog.
+
+The current planner tries large pieces first on observed wall support segments,
+checks rectangular footprint collisions and requires a fully visible guide in
+the first camera view. Failure means **no supported placement was found**, not
+proof that the furniture cannot fit anywhere in the room. Door/window segmentation,
+walkway constraints, semantic wall identification and complete 3D furniture rendering
+are not implemented. Large furniture may resemble a wall geometrically. Scale
+depends on the chest-height estimate, and a homography cannot reconstruct unseen
+product sides. Wall-oriented cutouts are rough guides for FLUX, not exact final
+geometry. The same planned transforms are included in the text prompt.
 
 ## Tests
 

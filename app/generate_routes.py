@@ -20,21 +20,24 @@ Multipart:
                     endpoint always composites at least one catalogue piece
                     into the room before calling FLUX.
     placements      JSON array, one entry per id in the same order, all keys
-                    optional — center_x, forward_offset_px, width_m, height_m,
-                    light_from, shadow_core, shadow_ambient, glossy_floor.
-                    Sizes default to the catalogue's measurements and positions
-                    to an even spread along the floor. Shadow and reflection
+                    optional — wall_id, wall_offset_m, wall_gap_m,
+                    mount_height_m, width_m, height_m, depth_m, light_from,
+                    shadow_core, shadow_ambient, glossy_floor.
+                    Sizes default to catalogue measurements. Supported walls
+                    determine positions and rotation, with footprint checks.
+                    Shadow and reflection
                     default OFF: FLUX lights the composite, and a baked-in
                     ellipse under a fixed light direction competes with it.
                     Pass a positive shadow_core/shadow_ambient to draw one.
-    geometry        JSON room description; defaults to the config's ROOM_*
-                    fractions, measured for the bundled room.png
-    scene           a room photograph, overriding room.png for this request
+    user_height     person's height in metres; defaults to PERSON_HEIGHT_M
+                    (1.75). Estimated camera height = user_height * 0.73,
+                    assuming the first room photo was taken at chest height.
+    rooms           up to three files of the same room; first is the main view
+    scene           a single room photograph, accepted instead of rooms
     references      extra reference images, up to the API's ceiling
 
-The room is a file on disk (config.ROOM_IMAGE_PATH, assets/room.png) rather
-than a catalogue entry: rooms are not uploaded anywhere yet, and this keeps the
-endpoint testable end to end until they are.
+Room photos come from the multipart rooms/scene uploads, with
+config.ROOM_IMAGE_PATH (assets/room.png) as the fallback when none are uploaded.
 
 Tokens are checked before the API call and debited only once an image comes
 back, so a failed, moderated or timed-out generation is free.
@@ -42,6 +45,8 @@ back, so a failed, moderated or timed-out generation is free.
 
 import io
 import json
+import logging
+import math
 import re
 from pathlib import Path
 
@@ -53,9 +58,13 @@ from .composite import Placement, compose, load_cutout
 from .errors import AppError, InsufficientTokens
 from .flux import MAX_REFERENCES
 from .prompt_builder import build_prompt, reference_from_catalogue
+
 from .vggt_scene import solve_scene
+from .placement_plan import plan_placements, PlacementConflict
 from .scene_validation import bad_request as _bad
-from .scene_validation import build_geometry, json_field, validate_placement
+from .scene_validation import json_field, validate_placement
+
+log = logging.getLogger(__name__)
 
 bp = Blueprint("generate", __name__, url_prefix="/api")
 
@@ -204,17 +213,6 @@ def _scenes():
     return [image], ["room1.png"]
 
 
-def _auto_center_x(index, count, geometry):
-    """Spread the pieces evenly across the reconstructed floor, left to right.
-
-    n objects go at 1/(n+1), 2/(n+1) … of the span, which keeps them off both
-    walls and apart from each other without the caller positioning anything.
-    The span is where VGGT actually found floor, not the whole image width.
-    """
-    x_left, x_right = geometry.floor_span
-    return x_left + (x_right - x_left) * (index + 1) / (count + 1)
-
-
 def _size_m(spec, metadata, key, cm_key, label):
     """Real-world size in metres: the caller's override, else the catalogue's."""
     if spec.get(key) is not None:
@@ -225,7 +223,7 @@ def _size_m(spec, metadata, key, cm_key, label):
         metres = float(centimetres) / 100.0
     except (TypeError, ValueError):
         metres = 0.0
-    if metres <= 0:
+    if not math.isfinite(metres) or metres <= 0:
         raise _bad(
             f"catalogue image {label} has no usable {cm_key}, so its size is "
             f"unknown — pass placements[].{key} for it"
@@ -257,13 +255,17 @@ def _catalogue_placements(fetched, specs, geometry):
                 code="cutout_unavailable",
             ) from None
 
-        center_x = spec.get("center_x")
-        if center_x is None:
-            center_x = _auto_center_x(index, len(fetched), geometry)
-
-        forward_offset = spec.get("forward_offset_px")
-        if forward_offset is None:
-            forward_offset = getattr(_config(), "ROOM_FORWARD_OFFSET", 0.0) * geometry.size[1]
+        if spec.get("center_x") is not None or spec.get("forward_offset_px") is not None:
+            raise _bad("Generation now uses wall-relative placement; replace center_x/"
+                       "forward_offset_px with wall_id, wall_offset_m and wall_gap_m.")
+        depth = spec.get("depth_m", metadata.get("depthCm"))
+        if depth is not None:
+            try:
+                depth = float(depth) if spec.get("depth_m") is not None else float(depth) / 100
+            except (TypeError, ValueError):
+                raise _bad(f"{label} needs a positive footprint depth") from None
+            if not math.isfinite(depth) or depth <= 0:
+                raise _bad(f"{label} needs a positive footprint depth")
 
         # Only the keys the caller actually sent. Anything omitted keeps the
         # Placement default, and those leave shadow and reflection off: FLUX
@@ -280,55 +282,116 @@ def _catalogue_placements(fetched, specs, geometry):
         placements.append(
             Placement(
                 image=cutout,
-                center_x=float(center_x),
+                center_x=0.0,  # unused: the wall planner supplies a 3D baseline
                 width_m=_size_m(spec, metadata, "width_m", "widthCm", label),
                 height_m=_size_m(spec, metadata, "height_m", "heightCm", label),
-                forward_offset_px=float(forward_offset),
+                depth_size_m=depth,
                 label=label,
                 **lighting,
             )
         )
-    return placements
+    return plan_placements(placements, specs, geometry)
+
+
+# The ratios the API accepts, as (w, h). An output shaped differently from the
+# room photograph forces the model to invent wall, window or door to fill the
+# edges the photograph does not cover, so the nearest of these is picked.
+ASPECT_CHOICES = ((21, 9), (16, 9), (3, 2), (4, 3), (5, 4), (1, 1),
+                  (4, 5), (3, 4), (2, 3), (9, 16), (9, 21))
+
+
+def _aspect_ratio_for(image):
+    """The listed ratio closest to `image`'s own shape, as "16:9"."""
+    ratio = image.width / image.height
+    w, h = min(ASPECT_CHOICES, key=lambda c: abs(c[0] / c[1] - ratio))
+    return f"{w}:{h}"
+
+
+def _user_camera_height():
+    """First-photo scale assumes a chest-held camera; same rule in both routes."""
+    geometry_spec = json_field("geometry", required=False)
+    if geometry_spec is not None:
+        if not isinstance(geometry_spec, dict):
+            raise _bad("`geometry` must be an object")
+        if geometry_spec:
+            raise _bad("Generation now uses `user_height` in metres instead of `geometry`; "
+                       "camera height is estimated for a chest-held camera.")
+    raw = request.form.get("user_height")
+    try:
+        height = float(raw if raw is not None else getattr(_config(), "PERSON_HEIGHT_M", 1.75))
+    except (TypeError, ValueError):
+        raise _bad("`user_height` must be a number in metres") from None
+    if not math.isfinite(height) or not 0 < height <= 3:
+        raise _bad("`user_height` must be between 0 and 3 metres")
+    ratio = getattr(_config(), "CHEST_HEIGHT_RATIO", 0.73)
+    if not math.isfinite(ratio) or not 0 < ratio <= 1:
+        raise AppError("CHEST_HEIGHT_RATIO must be between 0 and 1", status=503,
+                       code="geometry_unavailable")
+    return height * ratio
 
 
 def _composite(ids, specs):
     """Fetch `ids` from the catalogue and paste them into the room.
 
-    Returns `(result, geometry, fetched)`: the prompt builder needs the same
-    geometry and the same catalogue rows the composite was built from, and
+    Returns `(result, geometry, names, fetched)`: the prompt builder needs the
+    same geometry and the same catalogue rows the composite was built from, and
     re-fetching them would risk the prompt and the picture disagreeing.
+
+    All room views condition VGGT. Catalogue cutouts are warped into the
+    first view, and that composite becomes FLUX's first reference image.
     """
+    camera_height = _user_camera_height()
     fetched = _images().fetch(g.token, ids)
-
     scenes, names = _scenes()
-    geometry_spec = json_field("geometry", required=False)
-    camera_height_m = build_geometry(geometry_spec) if geometry_spec else None
-    if camera_height_m is None:
-        camera_height_m = getattr(_config(), "ROOM_CAMERA_HEIGHT_M", 1.10)
-
-    # Every view goes in; only the first comes back out.
     try:
-        geometry = solve_scene(scenes, camera_height_m=camera_height_m)
+        geometry = solve_scene(scenes, camera_height_m=camera_height)
     except ValueError as exc:
         raise AppError(
             f"the room could not be reconstructed: {exc}",
-            status=422,
-            code="scene_unsolvable",
+            status=422, code="scene_unsolvable",
         ) from None
     except ImportError as exc:
         raise AppError(
-            f"room reconstruction is unavailable here: {exc}",
-            status=503,
-            code="geometry_unavailable",
-        ) from None
+            "room reconstruction dependencies are unavailable",
+            status=503, code="geometry_unavailable",
+        ) from exc
 
-    placements = _catalogue_placements(fetched, specs, geometry)
     try:
-        return compose(scenes[0], placements, geometry), geometry, names, fetched
+        placements = _catalogue_placements(fetched, specs, geometry)
+    except PlacementConflict as exc:
+        raise AppError(str(exc), status=422, code="placement_conflict",
+                       details={"issues": exc.issues}) from None
+    try:
+        result = compose(scenes[0], placements, geometry)
     except ValueError as exc:
-        # An object that cannot be placed on the reconstructed floor —
-        # above the horizon, or behind the camera. The caller's numbers.
         raise _bad(str(exc)) from None
+    return result, geometry, names, fetched
+
+
+def _placement_specs(ids):
+    specs = json_field("placements", required=False) or []
+    if not isinstance(specs, list) or len(specs) > len(ids):
+        raise _bad("`placements` must be an array with at most one entry per image_id")
+    for index, spec in enumerate(specs):
+        validate_placement(spec, index, require_size=False)
+    return specs
+
+
+@bp.post("/generate/plan")
+@require_auth
+def placement_preview():
+    """Reconstruct and compose without a FLUX call or token debit."""
+    ids = _image_ids()
+    camera_height = _user_camera_height()
+    result, geometry, _names, _fetched = _composite(ids, _placement_specs(ids))
+    return jsonify(status="ready", camera_height_m=camera_height,
+                   placements=result.placement_plan,
+                   walls=[{"id": w.id, "origin_m": w.origin.tolist(),
+                           "right_axis": w.right.tolist(), "inward_axis": w.inward.tolist(),
+                           "start_m": w.start_m, "end_m": w.end_m,
+                           "residual_m": w.residual_m} for w in geometry.walls],
+                   limitations=["Geometric wall candidates; doors/windows are not segmented.",
+                                "Scale assumes a chest-held camera at user_height * CHEST_HEIGHT_RATIO; cutouts remain flat guides."])
 
 
 @bp.post("/generate")
@@ -340,24 +403,18 @@ def generate():
 
     ids = _image_ids()
 
-    specs = json_field("placements", required=False) or []
-    if not isinstance(specs, list):
-        raise _bad("`placements` must be a JSON array")
-    if len(specs) > len(ids):
-        raise _bad(
-            f"{len(ids)} image_ids but {len(specs)} placements — they are "
-            "matched by position, so there cannot be more placements than ids"
-        )
-    for index, spec in enumerate(specs):
-        validate_placement(spec, index, require_size=False)
+    _user_camera_height()  # validate before account lookups or reconstruction
+
+    specs = _placement_specs(ids)
 
     uploads = request.files.getlist("references")
-    # The composite itself goes to FLUX as a reference, so it takes one slot.
-    reference_count = len(uploads) + 1
+    # Image 1 guides layout; original catalogue photos preserve product identity.
+    reference_count = 1 + len(ids) + len(uploads)
     if reference_count > MAX_REFERENCES:
         raise _bad(
             f"at most {MAX_REFERENCES} reference images via the API, got "
-            f"{reference_count} including the composite"
+            f"{reference_count} — the composite, {len(ids)} product photo(s), "
+            f"and {len(uploads)} upload(s)"
         )
 
     aspect_ratio = request.form.get("aspect_ratio") or None
@@ -380,10 +437,19 @@ def generate():
             f"balance is {balance}"
         )
 
-    # First, so the prompt can call it "image 1" — the room with the
-    # furniture already in place is what the generation is conditioned on.
+    # First, so the prompt can call it "image 1" — the room is what the
+    # generation is conditioned on.
     composited, geometry, scene_names, fetched = _composite(ids, specs)
     references = [composited.image]
+
+    for metadata, content in fetched:
+        try:
+            product = Image.open(io.BytesIO(content))
+            product.load()
+        except (UnidentifiedImageError, OSError):
+            raise AppError(f"catalogue image {metadata.get('id')} is not readable",
+                           status=422, code="reference_unreadable") from None
+        references.append(product.convert("RGB"))
 
     for index, upload in enumerate(uploads):
         try:
@@ -395,10 +461,10 @@ def generate():
             ) from None
         references.append(image)
 
-    # The catalogue pieces are composited into image 1 rather than sent as
-    # separate references, so they carry no image index of their own.
+    # Exact originals are images 2..N+1, in catalogue-id order.
     catalogue_refs = [
-        reference_from_catalogue(metadata, specs[i] if i < len(specs) else None)
+        reference_from_catalogue(metadata, specs[i] if i < len(specs) else None,
+                                 image_index=i + 2)
         for i, (metadata, _content) in enumerate(fetched)
     ]
     full_prompt = build_prompt(
@@ -408,11 +474,46 @@ def generate():
         scene_name=scene_names[0],
     )
 
+    identity_prompt = (
+        "# IMAGE ROLES AND PRODUCT IDENTITY\n"
+        "Image 1 is a rough placement guide: preserve its room architecture, camera "
+        "and planned furniture positions. Its cutouts are flat approximations. "
+        "Use the original product images listed below as the authority for furniture "
+        "identity, silhouette, configuration, colour, materials and details. "
+        "Reproduce those exact products at the planned positions, adapting only "
+        "perspective and room lighting. Preserve each sofa's L-shaped or straight "
+        "configuration and chaise side and proportions as shown in its original image.\n"
+        + "\n".join(f"Image {i + 2}: {ref.filename} — {ref.furniture_type.label}"
+                    for i, ref in enumerate(catalogue_refs)) + "\n\n"
+    )
+
+    if composited.placement_plan:
+        full_prompt = ("# PLANNED COMPOSITION IN IMAGE 1\n"
+                       "Preserve each planned position and orientation. Furniture width axes "
+                       "follow their assigned walls; the floor supplies the vertical axis. "
+                       "Keep each supplied footprint and full chaise projection. "
+                       "Wall-mounted furniture uses the planned elevation.\n"
+                       + json.dumps(composited.placement_plan) + "\n\n" + full_prompt)
+
+    full_prompt = identity_prompt + full_prompt
+
+    # Log the assembled prompt and a rough token estimate for diagnosis.
+    log.info(
+        "PROMPT for %s: %d chars, ~%d tokens, %d reference image(s)",
+        scene_names[0],
+        len(full_prompt),
+        len(full_prompt) // 4,
+        len(references),
+    )
+    log.info("=============== PROMPT START ===============")
+    log.info(full_prompt)
+    log.info("================ PROMPT END ================")
+
     image = _flux().generate(
         full_prompt,
         references=references,
         seed=seed,
-        aspect_ratio=aspect_ratio or _config().FLUX_ASPECT_RATIO,
+        aspect_ratio=aspect_ratio or _aspect_ratio_for(composited.image),
         output_format=output_format,
         safety_tolerance=safety_tolerance,
     )
@@ -452,11 +553,14 @@ def quote():
     if catalogue < 1:
         raise _bad("`images` must be at least 1 — /api/generate always requires image_ids")
 
-    # The composite the catalogue images become is itself a reference.
-    cost = _cost(references + 1, catalogue)
+    total_references = 1 + catalogue + references
+    if total_references > MAX_REFERENCES:
+        raise _bad(f"composite + product photos + uploaded references exceed {MAX_REFERENCES} images")
+    cost = _cost(total_references, catalogue)
     balance = _client().get_balance(g.token)
     return jsonify(
         references=references,
+        totalReferences=total_references,
         images=catalogue,
         cost=cost,
         balance=balance,
