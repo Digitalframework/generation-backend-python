@@ -36,6 +36,7 @@ WHAT LIVES WHERE
   pip install torch "vggt @ git+https://github.com/facebookresearch/vggt"
 """
 
+import threading
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -91,6 +92,26 @@ class CompositeResult:
 # --------------------------------------------------------------------------- #
 # 1. cutout
 # --------------------------------------------------------------------------- #
+_REMBG_SESSION = None
+_REMBG_LOCK = threading.Lock()
+
+
+def _rembg_session():
+    """One background-removal session per process.
+
+    new_session() loads the ONNX model from disk, which took longer than the
+    removal itself when it ran per call. The session is safe to share across
+    threads; only creating it needs the lock.
+    """
+    global _REMBG_SESSION
+    with _REMBG_LOCK:
+        if _REMBG_SESSION is None:
+            from rembg import new_session
+
+            _REMBG_SESSION = new_session("isnet-general-use")
+        return _REMBG_SESSION
+
+
 def load_cutout(source, auto_rembg=True):
     """RGBA trimmed to the object.
 
@@ -108,11 +129,11 @@ def load_cutout(source, auto_rembg=True):
     if a.min() >= 250:
         if not auto_rembg:
             raise ValueError("image is fully opaque - no cutout present")
-        from rembg import new_session, remove
+        from rembg import remove
 
         rgba = remove(
             img.convert("RGB"),
-            session=new_session("isnet-general-use"),
+            session=_rembg_session(),
             alpha_matting=True,
             alpha_matting_foreground_threshold=240,
             alpha_matting_background_threshold=15,

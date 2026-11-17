@@ -10,6 +10,17 @@ python-dotenv==1.0.1
 gunicorn==23.0.0
 
 # ---------------------------------------------------------------------------
+# Generation jobs on Google Cloud - app/dispatch.py, job_store.py, storage.py
+#
+# Only imported when TASKS_MODE=cloud (or JOB_STORE=firestore /
+# STORAGE_BACKEND=gcs), so local mode runs without them. google-auth comes
+# with these and verifies the Cloud Tasks OIDC token on the worker route.
+# ---------------------------------------------------------------------------
+google-cloud-tasks>=2.16
+google-cloud-firestore>=2.16
+google-cloud-storage>=2.16
+
+# ---------------------------------------------------------------------------
 # Compositing - app/composite.py
 # ---------------------------------------------------------------------------
 # vggt declares numpy<2, so this cannot move to 2.x while vggt is a hard

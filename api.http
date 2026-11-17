@@ -63,6 +63,8 @@ Authorization: Bearer {{token}}
 # `rooms` is optional: without it the service falls back to the file at
 # ROOM_IMAGE_PATH (assets/room.png), which the repo ships empty, so a request
 # with neither answers 503 room_unavailable.
+# Answers 202 {jobId}; the generation runs as a job (TASKS_MODE).
+# @name generate
 POST {{host}}/api/generate
 Authorization: Bearer {{token}}
 Content-Type: multipart/form-data; boundary=----boundary
@@ -85,3 +87,13 @@ Content-Type: image/png
 
 < ./assets/room1.png
 ------boundary--
+
+
+### job status — poll until "done" or "failed"
+GET {{host}}/api/jobs/{{generate.response.body.jobId}}
+Authorization: Bearer {{token}}
+
+
+### job image — the generated PNG, once the job is done
+GET {{host}}/api/jobs/{{generate.response.body.jobId}}/image
+Authorization: Bearer {{token}}

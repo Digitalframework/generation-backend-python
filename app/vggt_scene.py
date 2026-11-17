@@ -80,6 +80,10 @@ FLOOR_TOLERANCE = 0.012
 
 _MODELS = {}
 _MODEL_LOCK = threading.Lock()
+# One forward pass at a time per process. Concurrent passes on the same model
+# do not run faster, they multiply peak memory - several at once ran a GPU out
+# of memory and made each one slower on CPU. Later requests wait here instead.
+_INFERENCE_LOCK = threading.Lock()
 _SOLVED = OrderedDict()
 _SOLVED_LOCK = threading.Lock()
 _SOLVED_MAX = 8
@@ -183,7 +187,7 @@ def _predict(scenes, model_id, device, all_views=False):
     images = torch.from_numpy(array).permute(0, 3, 1, 2).to(device)  # (S,3,H,W)
     autocast_dtype = _autocast_dtype(device)
 
-    with torch.no_grad():
+    with _INFERENCE_LOCK, torch.no_grad():
         with torch.autocast(
             device_type="cuda" if device.startswith("cuda") else "cpu",
             dtype=autocast_dtype,

@@ -105,8 +105,11 @@ def test_plan_endpoint_returns_transforms_without_flux_or_billing(app, client, m
     account, flux = Mock(), Mock()
     monkeypatch.setattr(routes, "_client", lambda: account)
     monkeypatch.setattr(routes, "_flux", lambda: flux)
+    scene = io.BytesIO()
+    Image.new("RGB", (32, 24), "white").save(scene, format="PNG")
+    scene.seek(0)
     response = client.post("/api/generate/plan", headers={"Authorization": "Bearer test"},
-                           data={"image_ids": "1"})
+                           data={"image_ids": "1", "scene": (scene, "room.png")})
     assert response.status_code == 200
     assert response.json["placements"][0]["wall_id"] == "wall_1"
     assert response.json["walls"][0]["id"] == "wall_1"
@@ -131,8 +134,9 @@ def test_conflict_stops_generation_before_flux_and_debit(app, client, monkeypatc
     stream.seek(0)
     response = client.post("/api/generate", headers={"Authorization": "Bearer test"},
                            data={"prompt": "furnish", "image_ids": "1", "scene": (stream, "room.png")})
-    assert response.status_code == 422
-    assert response.json["error"] == "placement_conflict"
-    assert response.json["details"]["issues"][0]["reason"] == "no_supported_placement"
+    # The conflict surfaces in the job, which inline mode has already run.
+    assert response.status_code == 202
+    assert response.json["status"] == "failed"
+    assert response.json["error"]["code"] == "placement_conflict"
     flux.generate.assert_not_called()
     account.spend.assert_not_called()

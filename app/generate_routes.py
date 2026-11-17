@@ -41,6 +41,13 @@ config.ROOM_IMAGE_PATH (assets/room.png) as the fallback when none are uploaded.
 
 Tokens are checked before the API call and debited only once an image comes
 back, so a failed, moderated or timed-out generation is free.
+
+Asynchronous: POST /api/generate validates, checks the balance, stores the
+uploads and answers 202 {jobId}. Steps 2-4 run later in run_generation(), on
+whatever config.TASKS_MODE dispatches to; GET /api/jobs/<jobId> reports the
+outcome (app/job_routes.py). The generation used to hold an HTTP request open
+for up to several minutes, which timed out behind proxies and let concurrent
+requests pile onto VGGT.
 """
 
 import io
@@ -48,16 +55,21 @@ import json
 import logging
 import math
 import re
+import time
+import uuid
 from pathlib import Path
 
 from PIL import Image, UnidentifiedImageError
-from flask import Blueprint, current_app, g, jsonify, request, send_file
+from flask import Blueprint, current_app, g, jsonify, request
 
 from .auth import require_auth
 from .composite import Placement, compose, load_cutout
 from .errors import AppError, InsufficientTokens
 from .flux import MAX_REFERENCES
+from .job_store import QUEUED, public_view
+from .logctx import job_context, stage
 from .prompt_builder import build_prompt, reference_from_catalogue
+from .storage import png_bytes
 
 from .vggt_scene import solve_scene
 from .placement_plan import plan_placements, PlacementConflict
@@ -330,7 +342,7 @@ def _user_camera_height():
     return height * ratio
 
 
-def _composite(ids, specs):
+def _composite(ids, specs, scenes, names, camera_height, token):
     """Fetch `ids` from the catalogue and paste them into the room.
 
     Returns `(result, geometry, names, fetched)`: the prompt builder needs the
@@ -339,12 +351,16 @@ def _composite(ids, specs):
 
     All room views condition VGGT. Catalogue cutouts are warped into the
     first view, and that composite becomes FLUX's first reference image.
+
+    Takes everything as arguments rather than from `request`: it runs inside
+    the plan request, but for /generate in a job worker with no request at all.
     """
-    camera_height = _user_camera_height()
-    fetched = _images().fetch(g.token, ids)
-    scenes, names = _scenes()
+    with stage(log, "catalogue fetch", ids=ids):
+        fetched = _images().fetch(token, ids)
     try:
-        geometry = solve_scene(scenes, camera_height_m=camera_height)
+        with stage(log, "room reconstruction (VGGT)", views=len(scenes),
+                   camera_height_m=round(camera_height, 3)):
+            geometry = solve_scene(scenes, camera_height_m=camera_height)
     except ValueError as exc:
         raise AppError(
             f"the room could not be reconstructed: {exc}",
@@ -357,12 +373,14 @@ def _composite(ids, specs):
         ) from exc
 
     try:
-        placements = _catalogue_placements(fetched, specs, geometry)
+        with stage(log, "placement planning", pieces=len(fetched)):
+            placements = _catalogue_placements(fetched, specs, geometry)
     except PlacementConflict as exc:
         raise AppError(str(exc), status=422, code="placement_conflict",
                        details={"issues": exc.issues}) from None
     try:
-        result = compose(scenes[0], placements, geometry)
+        with stage(log, "composite"):
+            result = compose(scenes[0], placements, geometry)
     except ValueError as exc:
         raise _bad(str(exc)) from None
     return result, geometry, names, fetched
@@ -383,7 +401,11 @@ def placement_preview():
     """Reconstruct and compose without a FLUX call or token debit."""
     ids = _image_ids()
     camera_height = _user_camera_height()
-    result, geometry, _names, _fetched = _composite(ids, _placement_specs(ids))
+    specs = _placement_specs(ids)
+    scenes, names = _scenes()
+    result, geometry, _names, _fetched = _composite(
+        ids, specs, scenes, names, camera_height, g.token
+    )
     return jsonify(status="ready", camera_height_m=camera_height,
                    placements=result.placement_plan,
                    walls=[{"id": w.id, "origin_m": w.origin.tolist(),
@@ -397,13 +419,29 @@ def placement_preview():
 @bp.post("/generate")
 @require_auth
 def generate():
+    """Validate, price, store the uploads and queue the job. Answers 202.
+
+    Everything that can be wrong with the request is caught here, before the
+    202, so the caller gets a 400 straight away rather than a failed job later.
+    """
+    started = time.perf_counter()
+    user_id = (g.user or {}).get("id")
+    room_files = request.files.getlist("rooms") or request.files.getlist("scene")
+    log.info(
+        "generate request: user=%s image_ids=%r rooms=%d references=%d "
+        "user_height=%s prompt=%d chars",
+        user_id, request.form.get("image_ids"), len(room_files),
+        len(request.files.getlist("references")), request.form.get("user_height"),
+        len((request.form.get("prompt") or "").strip()),
+    )
+
     prompt = (request.form.get("prompt") or "").strip()
     if not prompt:
         raise _bad("`prompt` is required")
 
     ids = _image_ids()
 
-    _user_camera_height()  # validate before account lookups or reconstruction
+    camera_height = _user_camera_height()  # validate before account lookups
 
     specs = _placement_specs(ids)
 
@@ -429,7 +467,10 @@ def generate():
     safety_tolerance = _int_field("safety_tolerance", 0, 6)
 
     cost = _cost(reference_count, len(ids))
-    balance = _client().get_balance(g.token)
+    with stage(log, "balance check", user=user_id):
+        balance = _client().get_balance(g.token)
+    log.info("balance %d, cost %d (%d catalogue, %d reference upload(s))",
+             balance, cost, len(ids), len(uploads))
     if balance < cost:
         raise InsufficientTokens(
             f"This generation costs {cost} tokens "
@@ -437,9 +478,86 @@ def generate():
             f"balance is {balance}"
         )
 
+    scenes, scene_names = _scenes()
+    references = []
+    for index, upload in enumerate(uploads):
+        try:
+            image = Image.open(upload.stream)
+            image.load()
+        except UnidentifiedImageError:
+            raise _bad(
+                f"references[{index}] ({upload.filename}) is not a readable image"
+            ) from None
+        references.append(image)
+
+    job_id = uuid.uuid4().hex
+    storage = current_app.extensions["storage"]
+    inputs = {"rooms": [], "references": []}
+    for kind, images in (("rooms", scenes), ("references", references)):
+        for index, image in enumerate(images):
+            key = f"{job_id}/{kind}/{index}.png"
+            storage.put(key, png_bytes(image), "image/png")
+            inputs[kind].append(key)
+
+    params = {
+        "prompt": prompt,
+        "image_ids": ids,
+        "placements": specs,
+        "camera_height_m": camera_height,
+        "scene_names": scene_names,
+        "aspect_ratio": aspect_ratio,
+        "output_format": output_format,
+        "seed": seed,
+        "safety_tolerance": safety_tolerance,
+        "cost": cost,
+    }
+    jobs = current_app.extensions["jobs"]
+    job = jobs.create({
+        "id": job_id,
+        "userId": (g.user or {}).get("id"),
+        "status": QUEUED,
+        # A JSON string, not a map: Firestore rejects nested arrays, and
+        # placements can carry them.
+        "params": json.dumps(params),
+        "inputs": inputs,
+        "attempts": 0,
+    })
+    with job_context(job_id):
+        log.info(
+            "job %s queued: mode=%s user=%s catalogue=%s rooms=%d references=%d "
+            "cost=%d balance_before=%d",
+            job_id, _config().TASKS_MODE, user_id, ids, len(scenes), len(references),
+            cost, balance,
+        )
+        current_app.extensions["dispatcher"].dispatch(job_id, g.token)
+    log.info("generate request answered 202 in %.2fs", time.perf_counter() - started)
+
+    # Inline mode has already finished the job; report where it actually is.
+    job = jobs.get(job_id) or job
+    body = public_view(job)
+    body["statusUrl"] = f"/api/jobs/{job_id}"
+    body["cost"] = cost
+    response = jsonify(body)
+    response.status_code = 202
+    response.headers["Location"] = body["statusUrl"]
+    return response
+
+
+def run_generation(params, scenes, uploads, token):
+    """Steps 2-4 for one queued job: catalogue, composite, FLUX.
+
+    Runs in a job worker, not a request. `params` is what generate() stored;
+    `scenes` and `uploads` are the images it stored. Returns the image and the
+    counts the job record reports. The token debit is the caller's job
+    (app/job_runner.py), so a retry can redo it without regenerating.
+    """
+    ids, specs = params["image_ids"], params["placements"]
+
     # First, so the prompt can call it "image 1" — the room is what the
     # generation is conditioned on.
-    composited, geometry, scene_names, fetched = _composite(ids, specs)
+    composited, geometry, scene_names, fetched = _composite(
+        ids, specs, scenes, params["scene_names"], params["camera_height_m"], token
+    )
     references = [composited.image]
 
     for metadata, content in fetched:
@@ -451,15 +569,7 @@ def generate():
                            status=422, code="reference_unreadable") from None
         references.append(product.convert("RGB"))
 
-    for index, upload in enumerate(uploads):
-        try:
-            image = Image.open(upload.stream)
-            image.load()
-        except UnidentifiedImageError:
-            raise _bad(
-                f"references[{index}] ({upload.filename}) is not a readable image"
-            ) from None
-        references.append(image)
+    references.extend(uploads)
 
     # Exact originals are images 2..N+1, in catalogue-id order.
     catalogue_refs = [
@@ -468,7 +578,7 @@ def generate():
         for i, (metadata, _content) in enumerate(fetched)
     ]
     full_prompt = build_prompt(
-        prompt,
+        params["prompt"],
         catalogue_refs,
         geometry=geometry,
         scene_name=scene_names[0],
@@ -499,7 +609,7 @@ def generate():
 
     # Log the assembled prompt and a rough token estimate for diagnosis.
     log.info(
-        "PROMPT for %s: %d chars, ~%d tokens, %d reference image(s)",
+        "prompt for %s: %d chars, ~%d tokens, %d reference image(s)",
         scene_names[0],
         len(full_prompt),
         len(full_prompt) // 4,
@@ -509,28 +619,24 @@ def generate():
     log.info(full_prompt)
     log.info("================ PROMPT END ================")
 
-    image = _flux().generate(
-        full_prompt,
-        references=references,
-        seed=seed,
-        aspect_ratio=aspect_ratio or _aspect_ratio_for(composited.image),
-        output_format=output_format,
-        safety_tolerance=safety_tolerance,
-    )
+    aspect_ratio = params["aspect_ratio"] or _aspect_ratio_for(composited.image)
+    with stage(log, "FLUX generation", references=len(references),
+               aspect_ratio=aspect_ratio, seed=params["seed"]):
+        image = _flux().generate(
+            full_prompt,
+            references=references,
+            seed=params["seed"],
+            aspect_ratio=aspect_ratio,
+            output_format=params["output_format"],
+            safety_tolerance=params["safety_tolerance"],
+        )
+    log.info("FLUX result %dx%d", image.width, image.height)
 
-    # Only now: a moderated, failed or timed-out generation costs nothing.
-    remaining = _client().spend(g.token, cost, reason=f"flux2:{len(references)}ref")
-
-    buffer = io.BytesIO()
-    image.save(buffer, format="PNG")
-    buffer.seek(0)
-
-    response = send_file(buffer, mimetype="image/png", download_name="generated.png")
-    response.headers["X-Tokens-Spent"] = str(cost)
-    response.headers["X-Token-Balance"] = str(remaining)
-    response.headers["X-References-Used"] = str(len(references))
-    response.headers["X-Catalogue-Images"] = str(len(ids))
-    return response
+    return {
+        "image": image,
+        "references_used": len(references),
+        "catalogue_images": len(ids),
+    }
 
 
 @bp.get("/generate/quote")

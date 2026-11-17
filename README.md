@@ -152,7 +152,7 @@ cp .env.example .env
 python wsgi.py
 ```
 
-Production: `waitress-serve --port=5000 wsgi:app` on Windows, `gunicorn -w 4 wsgi:app`
+Production: `waitress-serve --port=5000 wsgi:app` on Windows, `gunicorn -w 1 --threads 8 --timeout 900 wsgi:app`
 elsewhere.
 
 ## Endpoints
@@ -167,7 +167,9 @@ All but `/api/health` need `Authorization: Bearer <token from :8080/api/token>`.
 | GET | `http://localhost:5000/api/tokens/check?amount=1` | Whether the caller can afford N |
 | POST | `http://localhost:5000/api/tokens/spend` | Debit `{"amount": N, "reason": "…"}` |
 | GET | `http://localhost:5000/api/generate/quote?references=0&images=1` | What that generation would cost |
-| POST | `http://localhost:5000/api/generate` | FLUX.2 generation over a composite of catalogue pieces |
+| POST | `http://localhost:5000/api/generate` | Queues a FLUX.2 generation; answers 202 `{jobId}` |
+| GET | `http://localhost:5000/api/jobs/<jobId>` | Job status; cost and new balance once `done` |
+| GET | `http://localhost:5000/api/jobs/<jobId>/image` | The generated PNG |
 | GET | `http://localhost:5000/api/admin/health` | Example role gate, `ADMIN` only |
 
 Port 5000 is the default and what `docker-compose.yml` publishes. From another
@@ -198,11 +200,18 @@ curl -H "Authorization: Bearer $TOKEN" \
   -F references=@lamp.png \
   -F references=@room.png \
   -F aspect_ratio=16:9 -F seed=7 \
-  http://localhost:5000/api/generate -o generated.png
+  http://localhost:5000/api/generate
+# -> 202 {"jobId": "…", "status": "queued", "statusUrl": "/api/jobs/…", "cost": 9}
+
+curl -H "Authorization: Bearer $TOKEN" http://localhost:5000/api/jobs/<jobId>
+# -> {"status": "done", "imageUrl": "/api/jobs/<jobId>/image",
+#     "tokensSpent": 9, "balance": 41, "referencesUsed": 4, "catalogueImages": 1}
+curl -H "Authorization: Bearer $TOKEN" http://localhost:5000/api/jobs/<jobId>/image -o generated.png
 ```
 
-Response is the PNG, with `X-Tokens-Spent`, `X-Token-Balance` and
-`X-References-Used` headers.
+The generation runs as a job — see [Generation jobs](#generation-jobs). Status
+goes `queued` → `running` → `done` or `failed`; a failed job carries
+`error.code` and `error.message` (e.g. `content_moderated`, `placement_conflict`).
 
 | Field | | |
 | --- | --- | --- |
@@ -220,10 +229,8 @@ comes back, so a moderated, failed or timed-out generation is free.
 Practical notes:
 
 - **The API is asynchronous**: submit, get a `polling_url`, poll every
-  `FLUX_POLL_INTERVAL` until the status is `Ready`, then download. The whole
-  round trip happens inside the request, so a worker is tied up for its
-  duration — `FLUX_TIMEOUT` (180s) bounds that. Moving generation onto a queue
-  and returning a job id is the fix if throughput matters.
+  `FLUX_POLL_INTERVAL` until the status is `Ready`, then download. That round
+  trip happens in the job, not the request — `FLUX_TIMEOUT` (180s) bounds it.
 - **The result URL is signed and expires after ten minutes**, so the image is
   downloaded immediately and served from here rather than the URL being passed
   back to the caller.
@@ -231,7 +238,60 @@ Practical notes:
   base64'd into the request body, where an unresized phone photo is megabytes on
   the wire for no benefit.
 - Moderation comes back as a status (`Content Moderated` / `Request Moderated`),
-  not an HTTP error, and maps to **422 `content_moderated`** here.
+  not an HTTP error, and maps to a failed job with `content_moderated` here.
+
+## Generation jobs
+
+`POST /api/generate` validates the request, checks the balance, stores the room
+photos and references, and answers **202** straight away. The generation itself
+(catalogue fetch → VGGT → composite → FLUX → debit) runs in a job. Where it runs
+is one setting, `TASKS_MODE`:
+
+| `TASKS_MODE` | Runs jobs in | Job records | Images | Use for |
+| --- | --- | --- | --- | --- |
+| `local` (default) | thread pool in this process | `var/jobs/<id>/job.json` | `var/jobs/<id>/…` | localhost, docker compose |
+| `inline` | the request itself, before the 202 | same | same | tests, debugging |
+| `cloud` | Google Cloud Tasks → `POST /internal/jobs/run` | Firestore | Cloud Storage | production |
+
+Nothing besides `.env` changes between them. `JOB_STORE` (`file` | `firestore`)
+and `STORAGE_BACKEND` (`local` | `gcs`) follow `TASKS_MODE` but can be set on
+their own, e.g. to try the bucket from localhost.
+
+**Local mode** needs nothing installed beyond `requirements.txt`'s web part.
+`LOCAL_WORKER_THREADS` (2) jobs run at once; VGGT itself runs one forward pass
+at a time per process (`vggt_scene._INFERENCE_LOCK`), so the second slot is for
+a job waiting on FLUX. A restart drops jobs that were queued or running.
+
+**Cloud mode**, one-time setup (region and names are examples):
+
+```bash
+gcloud tasks queues create generate-jobs --location=europe-west3 \
+  --max-concurrent-dispatches=2 --max-attempts=3 --min-backoff=10s
+gcloud firestore databases create --location=europe-west3
+gcloud storage buckets create gs://innigo-generation-jobs --location=europe-west3
+gcloud iam service-accounts create tasks-invoker
+# the API's runtime account needs roles/cloudtasks.enqueuer, roles/datastore.user,
+# roles/storage.objectAdmin and roles/iam.serviceAccountUser on tasks-invoker
+```
+
+Then set `TASKS_MODE=cloud`, `GCP_PROJECT`, `GCP_LOCATION`, `WORKER_URL`,
+`TASKS_SERVICE_ACCOUNT` and `GCS_BUCKET` (see `.env.example`). The worker can be
+the same Cloud Run service as the API or a second one with a GPU and
+`--concurrency 1`; either way give it `--timeout 900`. `/internal/jobs/run`
+accepts only an OIDC token from `TASKS_SERVICE_ACCOUNT` with the expected
+audience, and answers 404 in any other mode.
+
+Retries (cloud only): bad input, moderation, insufficient tokens and an expired
+user token fail the job at once. FLUX or AuthAndSecurity trouble answers 503 so
+Cloud Tasks retries, until attempt `TASKS_MAX_ATTEMPTS`, which is recorded as
+final. If the image was generated but the debit failed, the retry only redoes
+the debit, so FLUX is never paid twice for one job.
+
+**Limitation — the user's token travels with the job.** The worker fetches the
+catalogue and debits the balance with the caller's access token, which lives 15
+minutes. It goes in the task body, never into Firestore. A job that waits longer
+fails with `unauthorized` and costs nothing. A service credential on
+AuthAndSecurity (debit on behalf of a user id) would remove the limit.
 
 ## Compositing
 

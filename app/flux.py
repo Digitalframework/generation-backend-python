@@ -139,8 +139,10 @@ class FluxClient:
         return polling_url
 
     def _poll(self, polling_url):
-        deadline = time.monotonic() + self.config.FLUX_TIMEOUT
+        started = time.monotonic()
+        deadline = started + self.config.FLUX_TIMEOUT
         interval = self.config.FLUX_POLL_INTERVAL
+        polls, last_status = 0, None
 
         while True:
             if time.monotonic() > deadline:
@@ -161,11 +163,16 @@ class FluxClient:
 
             body = _json(resp)
             status = body.get("status")
+            polls += 1
+            if status != last_status:
+                log.info("flux status %s after %.1fs", status, time.monotonic() - started)
+                last_status = status
 
             if status == "Ready":
                 sample = (body.get("result") or {}).get("sample")
                 if not sample:
                     raise UpstreamError(f"FLUX reported Ready with no image: {body}")
+                log.info("flux ready after %.1fs and %d polls", time.monotonic() - started, polls)
                 return sample
             if status in ("Error", "Failed"):
                 raise UpstreamError(f"FLUX generation failed: {body.get('result') or body}")

@@ -18,7 +18,7 @@ def photo(colour):
     return stream
 
 
-@pytest.mark.parametrize("room_count, expected_status", [(3, 200), (4, 400)])
+@pytest.mark.parametrize("room_count, expected_status", [(3, 202), (4, 400)])
 def test_room_uploads_reconstruct_and_composite_before_flux(
     app, client, monkeypatch, room_count, expected_status
 ):
@@ -67,7 +67,8 @@ def test_room_uploads_reconstruct_and_composite_before_flux(
     catalogue_refs = routes.build_prompt.call_args.args[1]
     assert catalogue_refs[0].image_index == 2
     assert "Image 2:" in flux.generate.call_args.args[0]
-    assert response.headers["X-References-Used"] == "2"
+    assert response.json["status"] == "done"
+    assert response.json["referencesUsed"] == 2
     account.spend.assert_called_once()
 
 
@@ -89,8 +90,10 @@ def test_original_products_precede_uploaded_refs_and_quote_matches(app, client, 
     monkeypatch.setattr(routes, "build_prompt", prompt_builder)
     response = client.post("/api/generate", headers={"Authorization": "Bearer test"},
                            data={"prompt": "furnish", "image_ids": "67,74",
+                                 "scene": (photo("white"), "room.png"),
                                  "references": (photo("blue"), "extra.png")})
-    assert response.status_code == 200
+    assert response.status_code == 202
+    assert response.json["status"] == "done"
     assert [im.getpixel((0, 0)) for im in flux.generate.call_args.kwargs["references"]] == [
         (128, 0, 128), (255, 0, 0), (0, 128, 0), (0, 0, 255)]
     assert [ref.image_index for ref in prompt_builder.call_args.args[1]] == [2, 3]
@@ -98,7 +101,7 @@ def test_original_products_precede_uploaded_refs_and_quote_matches(app, client, 
                        headers={"Authorization": "Bearer test"})
     assert quote.status_code == 200
     assert quote.json["totalReferences"] == 4
-    assert quote.json["cost"] == int(response.headers["X-Tokens-Spent"])
+    assert quote.json["cost"] == response.json["tokensSpent"]
 
 
 def test_reference_overflow_rejected_without_dropping_products(app, client, monkeypatch):
@@ -135,7 +138,7 @@ def test_both_endpoints_use_person_height_for_reconstruction(
     if height is not None:
         data["user_height"] = height
     response = client.post(endpoint, headers={"Authorization": "Bearer test"}, data=data)
-    assert response.status_code == 200
+    assert response.status_code == (200 if endpoint.endswith("/plan") else 202)
     assert reconstruction.call_args.kwargs["camera_height_m"] == pytest.approx(expected)
     if endpoint.endswith("/plan"):
         assert response.json["camera_height_m"] == pytest.approx(expected)

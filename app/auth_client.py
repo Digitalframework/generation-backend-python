@@ -113,10 +113,22 @@ class AuthServiceClient:
                 "answering — it is behind the session-cookie chain and does not "
                 "accept bearer tokens"
             )
-        if resp.status_code == 401:
-            raise AuthError("AuthAndSecurity rejected the token")
-        if resp.status_code == 403:
-            raise ForbiddenError("AuthAndSecurity denied access to this resource")
+        if resp.status_code in (401, 403):
+            # Spring answers 403 here for unrelated reasons — a token without the
+            # USER role (WWW-Authenticate: insufficient_scope), or no account behind
+            # the token's subject (a plain 403 body). Keep both clues: without them
+            # the 403 explains nothing.
+            details = {
+                "upstreamStatus": resp.status_code,
+                "wwwAuthenticate": resp.headers.get("WWW-Authenticate"),
+                "upstreamMessage": self._error_message(resp),
+            }
+            log.warning("AuthAndSecurity answered %s for %s: %s", resp.status_code, path, details)
+            if resp.status_code == 401:
+                raise AuthError("AuthAndSecurity rejected the token", details=details)
+            raise ForbiddenError(
+                f"AuthAndSecurity denied access to {path}", details=details
+            )
         if resp.status_code == 404:
             raise NotFoundError(f"No such endpoint on AuthAndSecurity: {path}")
         if resp.status_code in (402, 409):

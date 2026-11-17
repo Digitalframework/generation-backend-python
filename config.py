@@ -1,4 +1,5 @@
 import os
+import tempfile
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -109,6 +110,56 @@ class Config:
     # collapses the burst of reads a single page load makes.
     BALANCE_CACHE_TTL = _int("BALANCE_CACHE_TTL", 3)
 
+    # --- Generation jobs ------------------------------------------------------
+    # POST /api/generate answers 202 with a job id; the generation itself runs
+    # elsewhere and GET /api/jobs/<id> reports on it. TASKS_MODE picks where:
+    #
+    #   local   a thread pool inside this process. The default, and all that
+    #           localhost needs: no Google account, no extra services.
+    #   inline  runs before the 202 is sent. Tests and step-through debugging.
+    #   cloud   Google Cloud Tasks POSTs each job to WORKER_URL/internal/jobs/run.
+    #
+    # The job store and file storage default to match: on disk for local and
+    # inline, Firestore and Cloud Storage for cloud. Either can be overridden,
+    # e.g. TASKS_MODE=local with STORAGE_BACKEND=gcs to try the bucket locally.
+    TASKS_MODE = os.getenv("TASKS_MODE", "local").strip().lower()
+    _CLOUD = TASKS_MODE == "cloud"
+
+    # How many generations run at once in local mode. VGGT itself still runs
+    # one at a time (vggt_scene._INFERENCE_LOCK); the second slot lets one job
+    # wait on FLUX while the next one reconstructs its room.
+    LOCAL_WORKER_THREADS = _int("LOCAL_WORKER_THREADS", 2)
+
+    # file | firestore. The file store keeps one JSON per job next to its
+    # images, so every gunicorn worker on the machine sees the same jobs.
+    JOB_STORE = (os.getenv("JOB_STORE") or ("firestore" if _CLOUD else "file")).lower()
+    FIRESTORE_COLLECTION = os.getenv("FIRESTORE_COLLECTION", "generation_jobs")
+
+    # local | gcs. Uploaded rooms, references and the result image.
+    STORAGE_BACKEND = (os.getenv("STORAGE_BACKEND") or ("gcs" if _CLOUD else "local")).lower()
+    LOCAL_STORAGE_DIR = Path(os.getenv("LOCAL_STORAGE_DIR", "var/jobs"))
+    GCS_BUCKET = os.getenv("GCS_BUCKET") or None
+
+    # --- Google Cloud Tasks (TASKS_MODE=cloud only) ---------------------------
+    GCP_PROJECT = os.getenv("GCP_PROJECT") or os.getenv("GOOGLE_CLOUD_PROJECT") or None
+    GCP_LOCATION = os.getenv("GCP_LOCATION", "europe-west3")
+    TASKS_QUEUE = os.getenv("TASKS_QUEUE", "generate-jobs")
+    # Base URL of the service that runs jobs — this same app, deployed as the
+    # worker. The task is sent to WORKER_URL + /internal/jobs/run.
+    WORKER_URL = (os.getenv("WORKER_URL") or "").rstrip("/") or None
+    # Service account Cloud Tasks signs its OIDC token as. The worker endpoint
+    # accepts only tokens from this account.
+    TASKS_SERVICE_ACCOUNT = os.getenv("TASKS_SERVICE_ACCOUNT") or None
+    # The `aud` of that token. Defaults to WORKER_URL, which is what Cloud Run
+    # expects when it checks the token itself.
+    TASKS_OIDC_AUDIENCE = os.getenv("TASKS_OIDC_AUDIENCE") or WORKER_URL
+    # Must equal the queue's --max-attempts: on the last attempt a transient
+    # failure is recorded as final instead of being handed back for a retry.
+    TASKS_MAX_ATTEMPTS = _int("TASKS_MAX_ATTEMPTS", 3)
+    # How long Cloud Tasks waits for one attempt. VGGT + FLUX (FLUX_TIMEOUT)
+    # has to fit inside it; Cloud Tasks allows up to 1800s.
+    TASKS_DISPATCH_DEADLINE = _int("TASKS_DISPATCH_DEADLINE", 900)
+
 
 class TestConfig(Config):
     AUTH_BASE_URL = "http://auth.test"
@@ -122,3 +173,10 @@ class TestConfig(Config):
     FLUX_API_URL = "https://flux.test/v1/flux-2-pro"
     FLUX_POLL_INTERVAL = 0.01  # no real waiting in tests
     FLUX_TIMEOUT = 1
+    # Jobs finish before POST /api/generate returns, so a test can assert on
+    # the result straight away. Storage goes to a per-test directory (conftest).
+    TASKS_MODE = "inline"
+    _CLOUD = False
+    JOB_STORE = "file"
+    STORAGE_BACKEND = "local"
+    LOCAL_STORAGE_DIR = Path(tempfile.mkdtemp(prefix="innigo-test-jobs-"))
