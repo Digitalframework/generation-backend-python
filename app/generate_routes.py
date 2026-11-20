@@ -29,6 +29,19 @@ Multipart:
                     default OFF: FLUX lights the composite, and a baked-in
                     ellipse under a fixed light direction competes with it.
                     Pass a positive shadow_core/shadow_ambient to draw one.
+    edits           optional JSON array of positioned placements, any number up
+                    to MAX_EDITS, several may use the same catalogue piece:
+                    {"image_id": 7, "position": [x, y],
+                     "remove": [[[x, y], ...], ...]}.
+                    `image_id` must be one of image_ids. `position` is where
+                    that piece's front edge meets the floor, normalised 0..1
+                    on the first room photo — one copy of the piece stands
+                    there. `remove` are outlines (from /api/segment_selection)
+                    of what it replaces; they are erased from the photo before
+                    compositing. Pieces with at least one edit are not wall-
+                    planned; image_ids without any edit are, as before. This is
+                    how "replace these two armchairs with the selected chair,
+                    one moved over there" reaches the backend.
     user_height     person's height in metres; defaults to PERSON_HEIGHT_M
                     (1.75). Estimated camera height = user_height * 0.73,
                     assuming the first room photo was taken at chest height.
@@ -57,8 +70,10 @@ import math
 import re
 import time
 import uuid
+from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 from PIL import Image, UnidentifiedImageError
 from flask import Blueprint, current_app, g, jsonify, request
 
@@ -68,10 +83,12 @@ from .errors import AppError, InsufficientTokens
 from .flux import MAX_REFERENCES
 from .job_store import QUEUED, public_view
 from .logctx import job_context, stage
-from .prompt_builder import build_prompt, reference_from_catalogue
+from .prompt_builder import (build_prompt, intro_block, reference_from_catalogue,
+                             resolve_type)
 from .storage import png_bytes
 
 from .vggt_scene import solve_scene
+from . import sam_selection
 from .placement_plan import plan_placements, PlacementConflict
 from .scene_validation import bad_request as _bad
 from .scene_validation import json_field, validate_placement
@@ -243,11 +260,18 @@ def _size_m(spec, metadata, key, cm_key, label):
     return metres
 
 
-def _catalogue_placements(fetched, specs, geometry):
+def _catalogue_placements(fetched, specs, geometry, edits=()):
     placements = []
     for index, (metadata, content) in enumerate(fetched):
         spec = specs[index] if index < len(specs) else {}
         label = f"{metadata.get('name') or 'image'} (id {metadata.get('id')})"
+        # The furniture type drives the layout rules in placement_plan.py: a
+        # coffee table goes in front of the sofa, not against a wall.
+        try:
+            kind = resolve_type(spec.get("type"), metadata,
+                                spec.get("name") or metadata.get("name")).slug
+        except ValueError as exc:
+            raise _bad(f"placements[{index}].type: {exc}") from None
 
         try:
             cutout = load_cutout(io.BytesIO(content))
@@ -299,10 +323,155 @@ def _catalogue_placements(fetched, specs, geometry):
                 height_m=_size_m(spec, metadata, "height_m", "heightCm", label),
                 depth_size_m=depth,
                 label=label,
+                kind=kind,
                 **lighting,
             )
         )
-    return plan_placements(placements, specs, geometry)
+    # Every edit is one copy of its piece, standing where the user put it.
+    # Pieces nobody positioned go to the wall planner as before.
+    # Ids compared as text: the catalogue's JSON may carry them either way.
+    index_of = {str(metadata.get("id")): i for i, (metadata, _content) in enumerate(fetched)}
+    positioned = []
+    for edit in edits:
+        index = index_of.get(str(edit["image_id"]))
+        if index is None:
+            raise AppError(f"catalogue image {edit['image_id']} was not returned by the "
+                           "catalogue", status=422, code="reference_unreadable")
+        item = replace(placements[index])  # shares the cutout, own position
+        _place_at(item, edit["position"], geometry)
+        positioned.append(item)
+
+    used = {index_of.get(str(edit["image_id"])) for edit in edits}
+    planned = [i for i in range(len(placements)) if i not in used]
+    if planned:
+        try:
+            plan_placements([placements[i] for i in planned],
+                            [specs[i] if i < len(specs) else {} for i in planned], geometry)
+        except PlacementConflict as exc:
+            for issue in exc.issues:  # report indices into image_ids, not the subset
+                if "index" in issue:
+                    issue["index"] = planned[issue["index"]]
+            raise
+    return [placements[i] for i in planned] + positioned
+
+
+def _place_at(item, position, geometry):
+    """Stand `item` on the floor at an image point, facing the camera's way.
+
+    `position` is normalised (x, y) on the first photo: the bottom centre of
+    the moved selection, i.e. where the piece's front edge meets the floor.
+    The ray through that pixel hits the reconstructed floor plane; that point
+    is the front baseline the warp builds the upright rectangle from. The
+    width axis follows the nearest wall, so a chair placed near a wall lines up
+    with it; with no walls, it follows the camera's horizontal axis.
+    """
+    x = position[0] * geometry.size[0]
+    y = position[1] * geometry.size[1]
+    try:
+        base = geometry.floor_point(x, y) / geometry.units_per_metre
+    except ValueError:
+        raise AppError(
+            f"{item.label} was moved to a spot that is not on the floor — "
+            "drag it lower in the picture",
+            status=422, code="position_off_floor",
+        ) from None
+
+    up = np.asarray(geometry.normal, dtype=float)
+    if geometry.walls:
+        nearest = min(geometry.walls, key=lambda w: abs((base - w.origin) @ w.inward))
+        right = np.asarray(nearest.right, dtype=float)
+    else:
+        right = np.array([1.0, 0.0, 0.0])
+    right = right - (right @ up) * up
+    right /= np.linalg.norm(right)
+
+    item.base_m, item.right_axis = base, right
+    item.wall_id, item.mount_height_m = None, 0.0
+
+
+# Longest side the old furniture is erased at. Telea inpainting costs grow with
+# the hole's area; FLUX repaints the region anyway, so a smaller pass suffices.
+ERASE_LONG_SIDE = 1024
+
+
+def _erase(scene, edits):
+    """The room with the replaced furniture painted out, or `scene` unchanged.
+
+    Fills each `remove` outline (grown by ~1% so the old piece's edge goes
+    too) from its surroundings with OpenCV's Telea inpainting. Crude, but
+    local and instant; the result goes to FLUX as image 1, which is told to
+    render those areas as empty room.
+    """
+    polygons = [poly for edit in edits or () for poly in edit.get("remove") or ()]
+    if not polygons:
+        return scene
+
+    import cv2
+
+    rgb = np.asarray(scene.convert("RGB"))
+    height, width = rgb.shape[:2]
+    mask = np.zeros((height, width), np.uint8)
+    for polygon in polygons:
+        points = np.round(np.asarray(polygon, dtype=float) * [width, height]).astype(np.int32)
+        cv2.fillPoly(mask, [points], 255)
+    grow = max(2, round(0.01 * max(width, height)))
+    mask = cv2.dilate(mask, np.ones((2 * grow + 1, 2 * grow + 1), np.uint8))
+
+    scale = min(1.0, ERASE_LONG_SIDE / max(width, height))
+    small_size = (max(1, round(width * scale)), max(1, round(height * scale)))
+    small = cv2.resize(rgb, small_size, interpolation=cv2.INTER_AREA)
+    small_mask = cv2.resize(mask, small_size, interpolation=cv2.INTER_NEAREST)
+    filled = cv2.inpaint(small, small_mask, max(3, round(grow * scale)), cv2.INPAINT_TELEA)
+    filled = cv2.resize(filled, (width, height), interpolation=cv2.INTER_CUBIC)
+
+    out = rgb.copy()
+    out[mask > 0] = filled[mask > 0]
+    return Image.fromarray(out)
+
+
+# Positioned placements per generation. Each is a warp plus a FLUX instruction;
+# beyond a dozen the prompt stops being followed reliably anyway.
+MAX_EDITS = 12
+
+
+def _edits(ids):
+    """`edits` validated: positioned placements, each naming one of `ids`."""
+    edits = json_field("edits", required=False)
+    if edits is None:
+        return []
+    if not isinstance(edits, list) or len(edits) > MAX_EDITS:
+        raise _bad(f"`edits` must be an array of at most {MAX_EDITS} placements")
+
+    cleaned, total_points = [], 0
+    for index, edit in enumerate(edits):
+        if not isinstance(edit, dict):
+            raise _bad(f"edits[{index}] must be an object")
+        image_id = edit.get("image_id")
+        if isinstance(image_id, bool) or not isinstance(image_id, int) or image_id not in ids:
+            raise _bad(f"edits[{index}].image_id must be one of image_ids {ids}")
+        position = edit.get("position")
+        if not (isinstance(position, list) and len(position) == 2
+                and all(_unit_number(v) for v in position)):
+            raise _bad(f"edits[{index}].position must be [x, y] with values between 0 and 1")
+
+        remove = edit.get("remove") or []
+        if not isinstance(remove, list):
+            raise _bad(f"edits[{index}].remove must be a list of outlines")
+        outlines = []
+        for polygon in remove:
+            if not (isinstance(polygon, list) and len(polygon) >= 3 and all(
+                isinstance(p, list) and len(p) == 2 and all(_unit_number(v) for v in p)
+                for p in polygon
+            )):
+                raise _bad(f"edits[{index}].remove must hold outlines of at least three "
+                           "[x, y] points between 0 and 1")
+            total_points += len(polygon)
+            outlines.append([[float(x), float(y)] for x, y in polygon])
+        if total_points > 5000:
+            raise _bad("`edits` outlines are too detailed — at most 5000 points in total")
+        cleaned.append({"image_id": image_id, "position": [float(v) for v in position],
+                        "remove": outlines})
+    return cleaned
 
 
 # The ratios the API accepts, as (w, h). An output shaped differently from the
@@ -342,7 +511,7 @@ def _user_camera_height():
     return height * ratio
 
 
-def _composite(ids, specs, scenes, names, camera_height, token):
+def _composite(ids, specs, scenes, names, camera_height, token, edits=None):
     """Fetch `ids` from the catalogue and paste them into the room.
 
     Returns `(result, geometry, names, fetched)`: the prompt builder needs the
@@ -351,6 +520,10 @@ def _composite(ids, specs, scenes, names, camera_height, token):
 
     All room views condition VGGT. Catalogue cutouts are warped into the
     first view, and that composite becomes FLUX's first reference image.
+    With `edits`, the furniture they replace is erased from that view first,
+    and their pieces stand at the given floor positions (see `_place_at`).
+    VGGT still sees the original photos: an inpainted patch is no evidence
+    about where the floor and walls are.
 
     Takes everything as arguments rather than from `request`: it runs inside
     the plan request, but for /generate in a job worker with no request at all.
@@ -358,9 +531,7 @@ def _composite(ids, specs, scenes, names, camera_height, token):
     with stage(log, "catalogue fetch", ids=ids):
         fetched = _images().fetch(token, ids)
     try:
-        with stage(log, "room reconstruction (VGGT)", views=len(scenes),
-                   camera_height_m=round(camera_height, 3)):
-            geometry = solve_scene(scenes, camera_height_m=camera_height)
+        geometry = _reconstruct(scenes, camera_height)
     except ValueError as exc:
         raise AppError(
             f"the room could not be reconstructed: {exc}",
@@ -374,16 +545,43 @@ def _composite(ids, specs, scenes, names, camera_height, token):
 
     try:
         with stage(log, "placement planning", pieces=len(fetched)):
-            placements = _catalogue_placements(fetched, specs, geometry)
+            placements = _catalogue_placements(fetched, specs, geometry, edits or [])
     except PlacementConflict as exc:
         raise AppError(str(exc), status=422, code="placement_conflict",
                        details={"issues": exc.issues}) from None
+    canvas = scenes[0]
+    if edits:
+        with stage(log, "erase replaced furniture",
+                   placements=len(edits), outlines=sum(len(e["remove"]) for e in edits)):
+            canvas = _erase(scenes[0], edits)
     try:
         with stage(log, "composite"):
-            result = compose(scenes[0], placements, geometry)
+            result = compose(canvas, placements, geometry)
     except ValueError as exc:
         raise _bad(str(exc)) from None
     return result, geometry, names, fetched
+
+
+def _reconstruct(scenes, camera_height):
+    """VGGT over every view; if that finds no floor, over the main photo alone.
+
+    Extra views usually sharpen the reconstruction, but views of the far side of
+    the room share little with the main photo, and VGGT then reports too little
+    confident floor depth in frame 0 to fit a plane. Only frame 0's geometry is
+    used, so the main photo by itself is a valid answer rather than a failure.
+    """
+    try:
+        with stage(log, "room reconstruction (VGGT)", views=len(scenes),
+                   camera_height_m=round(camera_height, 3)):
+            return solve_scene(scenes, camera_height_m=camera_height)
+    except ValueError as exc:
+        if len(scenes) < 2:
+            raise
+        log.warning("reconstruction from %d views failed (%s); retrying with the "
+                    "main photo only", len(scenes), exc)
+    with stage(log, "room reconstruction (VGGT), main photo only",
+               camera_height_m=round(camera_height, 3)):
+        return solve_scene(scenes[:1], camera_height_m=camera_height)
 
 
 def _placement_specs(ids):
@@ -402,9 +600,10 @@ def placement_preview():
     ids = _image_ids()
     camera_height = _user_camera_height()
     specs = _placement_specs(ids)
+    edits = _edits(ids)
     scenes, names = _scenes()
     result, geometry, _names, _fetched = _composite(
-        ids, specs, scenes, names, camera_height, g.token
+        ids, specs, scenes, names, camera_height, g.token, edits
     )
     return jsonify(status="ready", camera_height_m=camera_height,
                    placements=result.placement_plan,
@@ -444,6 +643,7 @@ def generate():
     camera_height = _user_camera_height()  # validate before account lookups
 
     specs = _placement_specs(ids)
+    edits = _edits(ids)
 
     uploads = request.files.getlist("references")
     # Image 1 guides layout; original catalogue photos preserve product identity.
@@ -503,6 +703,7 @@ def generate():
         "prompt": prompt,
         "image_ids": ids,
         "placements": specs,
+        "edits": edits,
         "camera_height_m": camera_height,
         "scene_names": scene_names,
         "aspect_ratio": aspect_ratio,
@@ -552,11 +753,12 @@ def run_generation(params, scenes, uploads, token):
     (app/job_runner.py), so a retry can redo it without regenerating.
     """
     ids, specs = params["image_ids"], params["placements"]
+    edits = params.get("edits") or []  # jobs queued before edits existed have none
 
     # First, so the prompt can call it "image 1" — the room is what the
     # generation is conditioned on.
     composited, geometry, scene_names, fetched = _composite(
-        ids, specs, scenes, params["scene_names"], params["camera_height_m"], token
+        ids, specs, scenes, params["scene_names"], params["camera_height_m"], token, edits
     )
     references = [composited.image]
 
@@ -577,35 +779,32 @@ def run_generation(params, scenes, uploads, token):
                                  image_index=i + 2)
         for i, (metadata, _content) in enumerate(fetched)
     ]
-    full_prompt = build_prompt(
+    # Order follows how FLUX.2 reads: the start weighs most. Task and product
+    # lines first, then anything special about this request, then the layout,
+    # the standing directives, the user's words and the room size.
+    sections = [intro_block(catalogue_refs, uploads=len(uploads))]
+
+    if any(edit["remove"] for edit in edits):
+        sections.append(
+            "# REPLACED FURNITURE\n"
+            "The furniture the user is replacing has been erased from image 1, and the "
+            "erased areas look smudged. Show bare floor, wall and skirting there, "
+            "continuing naturally from their surroundings; the catalogue products stand "
+            "at their planned positions."
+        )
+
+    fixed = _fixed_positions_prompt(composited.placement_plan, geometry, fetched, ids)
+    if fixed:
+        sections.append(fixed.strip())
+
+    sections.append(build_prompt(
         params["prompt"],
         catalogue_refs,
         geometry=geometry,
         scene_name=scene_names[0],
-    )
-
-    identity_prompt = (
-        "# IMAGE ROLES AND PRODUCT IDENTITY\n"
-        "Image 1 is a rough placement guide: preserve its room architecture, camera "
-        "and planned furniture positions. Its cutouts are flat approximations. "
-        "Use the original product images listed below as the authority for furniture "
-        "identity, silhouette, configuration, colour, materials and details. "
-        "Reproduce those exact products at the planned positions, adapting only "
-        "perspective and room lighting. Preserve each sofa's L-shaped or straight "
-        "configuration and chaise side and proportions as shown in its original image.\n"
-        + "\n".join(f"Image {i + 2}: {ref.filename} — {ref.furniture_type.label}"
-                    for i, ref in enumerate(catalogue_refs)) + "\n\n"
-    )
-
-    if composited.placement_plan:
-        full_prompt = ("# PLANNED COMPOSITION IN IMAGE 1\n"
-                       "Preserve each planned position and orientation. Furniture width axes "
-                       "follow their assigned walls; the floor supplies the vertical axis. "
-                       "Keep each supplied footprint and full chaise projection. "
-                       "Wall-mounted furniture uses the planned elevation.\n"
-                       + json.dumps(composited.placement_plan) + "\n\n" + full_prompt)
-
-    full_prompt = identity_prompt + full_prompt
+        plan=composited.placement_plan,
+    ))
+    full_prompt = "\n\n".join(section for section in sections if section)
 
     # Log the assembled prompt and a rough token estimate for diagnosis.
     log.info(
@@ -634,9 +833,168 @@ def run_generation(params, scenes, uploads, token):
 
     return {
         "image": image,
+        # Kept with the job (var/jobs/<id>/composite.png locally) to see what
+        # FLUX was shown when its result disagrees with the placement.
+        "composite": composited.image,
         "references_used": len(references),
         "catalogue_images": len(ids),
     }
+
+
+def _unit_number(value):
+    return (isinstance(value, (int, float)) and not isinstance(value, bool)
+            and math.isfinite(value) and 0 <= value <= 1)
+
+
+def _selection_box():
+    """`box` as (x0, y0, x1, y1), normalised 0..1, with x0 < x1 and y0 < y1."""
+    box = json_field("box")
+    if not (isinstance(box, list) and len(box) == 4 and all(_unit_number(v) for v in box)):
+        raise _bad("`box` must be [x0, y0, x1, y1] with values between 0 and 1")
+    x0, y0, x1, y1 = box
+    if x1 <= x0 or y1 <= y0:
+        raise _bad("`box` must have x0 < x1 and y0 < y1")
+    return tuple(float(v) for v in box)
+
+
+def _selection_points():
+    """Optional refinement clicks: `points` [[x, y], ...] and `point_labels` [1|0, ...]."""
+    points = json_field("points", required=False)
+    if points is None:
+        return None, None
+    if not (isinstance(points, list) and len(points) <= 32 and all(
+        isinstance(p, list) and len(p) == 2 and all(_unit_number(v) for v in p)
+        for p in points
+    )):
+        raise _bad("`points` must be at most 32 [x, y] pairs with values between 0 and 1")
+    labels = json_field("point_labels", required=False)
+    if labels is None:
+        labels = [1] * len(points)
+    if not (isinstance(labels, list) and len(labels) == len(points)
+            and all(label in (0, 1) and not isinstance(label, bool) for label in labels)):
+        raise _bad("`point_labels` must hold one 1 (object) or 0 (background) per point")
+    return [tuple(p) for p in points], labels
+
+
+@bp.post("/segment_selection")
+@require_auth
+def segment_selection():
+    """Outline of the object inside a dragged box, by SAM 2.1. Synchronous, free.
+
+    Multipart:
+
+        image         the room photograph the box was drawn on
+        photo_id      the client's stable id for that photo; with a hash of the
+                      pixels it keys the embedding cache, so the expensive image
+                      encoder runs once per photo, not once per box
+        box           JSON [x0, y0, x1, y1], normalised 0..1
+        points        optional JSON [[x, y], ...], normalised — refinement clicks
+        point_labels  optional JSON [1|0, ...]; 1 = object, 0 = background.
+                      Defaults to all 1.
+
+    200: {"polygons": [[[x, y], ...], ...], "score": float,
+          "bounds": [x0, y0, x1, y1] | null, "width": px, "height": px}
+    Outlines are normalised, largest first. An empty list means SAM found no
+    object in the box; the client then keeps the box itself as the area.
+
+    No token cost: it is a selection aid on the way to a paid generation, and
+    charging per drag would punish the user for adjusting a box.
+    """
+    started = time.perf_counter()
+    upload = request.files.get("image")
+    if upload is None:
+        raise _bad("`image` is required — the photo the box was drawn on")
+    try:
+        image = Image.open(upload.stream)
+        image.load()
+    except UnidentifiedImageError:
+        raise _bad("`image` is not a readable image") from None
+
+    box = _selection_box()
+    points, labels = _selection_points()
+    photo_id = (request.form.get("photo_id") or "").strip()[:128] or None
+
+    config = _config()
+    try:
+        selection = sam_selection.segment(
+            image, box, points=points, point_labels=labels, photo_id=photo_id,
+            model=getattr(config, "SAM_MODEL", sam_selection.DEFAULT_MODEL),
+            device=getattr(config, "SAM_DEVICE", None),
+            cache_size=getattr(config, "SAM_EMBEDDING_CACHE", 8),
+        )
+    except sam_selection.SegmentationUnavailable as exc:
+        raise AppError(str(exc), status=503, code="segmentation_unavailable") from None
+
+    log.info("segment_selection: user=%s photo=%s %dx%d polygons=%d score=%.3f in %.2fs",
+             (g.user or {}).get("id"), photo_id, selection.width, selection.height,
+             len(selection.polygons), selection.score, time.perf_counter() - started)
+    return jsonify(
+        polygons=selection.polygons,
+        score=round(selection.score, 4),
+        bounds=list(selection.bounds) if selection.bounds else None,
+        width=selection.width,
+        height=selection.height,
+    )
+
+
+def _where(x, y):
+    """Plain-language spot in the frame for a normalised point."""
+    across = "left" if x < 1 / 3 else "centre" if x < 2 / 3 else "right"
+    depth = ("close to the camera" if y > 0.75 else "in the middle of the room" if y > 0.55
+             else "towards the back of the room")
+    return f"{across} of the frame, {depth}"
+
+
+def _fixed_positions_prompt(plan, geometry, fetched, ids):
+    """Where each hand-placed piece is, in terms of the picture.
+
+    The planned composition is metres in camera space, which FLUX cannot relate
+    to the image. This states the same thing as percentages of the frame,
+    taken from the projected outline the composite pasted the piece into.
+    Hand-placed pieces are the plan entries without a `relation`: the planner
+    always records one.
+    """
+    # The wall planner fills in `relation` for everything it places, so a
+    # plan entry with neither a relation nor a wall was positioned by hand.
+    hand_placed = [entry for entry in plan or ()
+                   if entry.get("relation") is None and entry.get("wall_id") is None]
+    if not hand_placed or geometry is None:
+        return ""
+    names = {str(m.get("id")): (m.get("name") or "piece", i + 2)
+             for i, (m, _content) in enumerate(fetched)}
+    width, height = geometry.size
+    lines = []
+    for entry in hand_placed:
+        try:
+            quad, _ppm = geometry.object_quad(
+                None, entry["width_m"], entry["height_m"],
+                base_m=entry["base_m"], right_axis=entry["right_axis"],
+            )
+        except (ValueError, KeyError, TypeError):
+            continue
+        x0, y0 = quad[:, 0].min() / width, quad[:, 1].min() / height
+        x1, y1 = quad[:, 0].max() / width, quad[:, 1].max() / height
+        foot_x, foot_y = (x0 + x1) / 2, y1
+        label = entry.get("label") or "piece"
+        image_index = next((index for key, (_name, index) in names.items()
+                            if f"(id {key})" in label), None)
+        source = f" (image {image_index})" if image_index else ""
+        lines.append(
+            f"* {label}{source}: stands {_where(foot_x, foot_y)} — its feet at "
+            f"{foot_x:.0%} from the left and {foot_y:.0%} from the top; it fills the "
+            f"area from {max(x0, 0):.0%} to {min(x1, 1):.0%} across and "
+            f"{max(y0, 0):.0%} to {min(y1, 1):.0%} down."
+        )
+    if not lines:
+        return ""
+    return (
+        "# FIXED POSITIONS — HIGHEST PRIORITY\n"
+        "The user placed these pieces by hand. Image 1 shows each one at its final "
+        "spot and size. Each one stays exactly there, at the same place and size in "
+        "the frame, even where another spot would look more natural. These positions "
+        "take priority over the layout below.\n"
+        + "\n".join(lines) + "\n\n"
+    )
 
 
 @bp.get("/generate/quote")

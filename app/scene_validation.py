@@ -92,7 +92,8 @@ def validate_placement(spec, index, require_size=True):
             raise bad_request(f"placements[{index}].{key} is required and must be a number")
 
     for key in ("center_x", "width_m", "height_m", "depth_m", "forward_offset_px",
-                "wall_offset_m", "wall_gap_m", "mount_height_m"):
+                "wall_offset_m", "wall_gap_m", "mount_height_m",
+                "seat_depth_m", "chaise_width_m"):
         value = spec.get(key)
         if value is None:
             continue
@@ -100,7 +101,7 @@ def validate_placement(spec, index, require_size=True):
             raise bad_request(f"placements[{index}].{key} must be a number")
         if not math.isfinite(value):
             raise bad_request(f"placements[{index}].{key} must be finite")
-    for key in ("width_m", "height_m", "depth_m"):
+    for key in ("width_m", "height_m", "depth_m", "seat_depth_m", "chaise_width_m"):
         if spec.get(key) is not None and spec[key] <= 0:
             raise bad_request(f"placements[{index}].{key} must be positive")
     for key in ("wall_gap_m", "mount_height_m"):
@@ -108,6 +109,14 @@ def validate_placement(spec, index, require_size=True):
             raise bad_request(f"placements[{index}].{key} must be nonnegative")
     if spec.get("wall_id") is not None and not isinstance(spec["wall_id"], str):
         raise bad_request(f"placements[{index}].wall_id must be a string")
+
+    # An L-sofa's chaise, on the left or right as seen facing the sofa (the
+    # way its product photo shows it). With it, the planner keeps the inner
+    # corner of the L free for the coffee table.
+    if spec.get("chaise_side") not in (None, "left", "right"):
+        raise bad_request(f"placements[{index}].chaise_side must be 'left' or 'right'")
+    if spec.get("type") is not None and not isinstance(spec["type"], str):
+        raise bad_request(f"placements[{index}].type must be a string")
 
     if spec.get("light_from", "left") not in ("left", "right"):
         raise bad_request(f"placements[{index}].light_from must be 'left' or 'right'")

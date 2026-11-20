@@ -69,6 +69,8 @@ class Placement:
     right_axis: np.ndarray = None  # chosen wall tangent
     wall_id: str = None
     mount_height_m: float = 0.0
+    kind: str = None  # furniture type slug (prompt_builder.TYPES); drives the layout rules
+    relation: dict = None  # how the planner placed it, for the prompt; None if hand-placed
 
     @property
     def casts_shadow(self):
@@ -280,7 +282,8 @@ def compose(scene, placements, geometry, verbose=False):
     plan = [{"index": index, "label": item.label, "wall_id": item.wall_id,
              "base_m": item.base_m.tolist(), "right_axis": item.right_axis.tolist(),
              "width_m": item.width_m, "height_m": item.height_m,
-             "depth_m": item.depth_size_m, "mount_height_m": item.mount_height_m}
+             "depth_m": item.depth_size_m, "mount_height_m": item.mount_height_m,
+             "type": item.kind, "relation": item.relation}
             for index, item in enumerate(placements) if item.base_m is not None]
     return CompositeResult(image=comp, mask=mask, scale=scales, placement_plan=plan)
 

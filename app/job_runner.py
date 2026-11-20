@@ -63,6 +63,10 @@ def _run_job(job_id, token, attempt, max_attempts):
             key = f"{job_id}/result.png"
             with stage(log, "store result", key=key):
                 storage.put(key, png_bytes(outcome["image"]), "image/png")
+                if outcome.get("composite") is not None:
+                    # What FLUX was given as image 1, for comparing with the result.
+                    storage.put(f"{job_id}/composite.png", png_bytes(outcome["composite"]),
+                                "image/png")
             # Recorded before the debit: if the debit fails transiently, the
             # retry finds the image here and does not pay FLUX a second time.
             job = jobs.update(job_id, status=CHARGING, resultKey=key, result={

@@ -55,6 +55,20 @@ torch==2.9.1 ; sys_platform == "win32" and python_version == "3.12"
 vggt @ https://github.com/facebookresearch/vggt/archive/a288dd0f14786c93483e45524328726ab7b1b4ce.zip
 
 # ---------------------------------------------------------------------------
+# Object selection - app/sam_selection.py (POST /api/segment_selection)
+#
+# SAM 2.1 runs on the same torch as VGGT, so AMD ROCm on Windows works through
+# requirements-rocm-windows.txt as well. Its CUDA extension is optional (hole
+# filling only); setup.py skips it if the build fails. To skip the attempt and
+# reuse the installed ROCm/CUDA torch instead of downloading one for the build:
+#     set SAM2_BUILD_CUDA=0            (PowerShell: $env:SAM2_BUILD_CUDA="0")
+#     pip install --no-build-isolation sam2==1.1.0
+# hydra-core and iopath come with it. Weights download from Hugging Face on
+# first use (SAM_MODEL in config.py).
+# ---------------------------------------------------------------------------
+sam2==1.1.0
+
+# ---------------------------------------------------------------------------
 # dev / test
 # ---------------------------------------------------------------------------
 pytest==8.3.3

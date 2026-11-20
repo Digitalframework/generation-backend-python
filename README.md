@@ -37,6 +37,20 @@ Test scene reconstruction directly with an actual room photo:
 .\.venv\Scripts\python.exe -c "from app.vggt_scene import solve_scene; solve_scene('assets/room.png', device='cuda', verbose=True)"
 ```
 
+SAM 2.1 for `POST /api/segment_selection` runs on the same ROCm torch
+(`app/sam_selection.py` reuses VGGT's device and FP16 autocast choice). Install
+it into the same environment without building its optional CUDA extension:
+
+```powershell
+$env:SAM2_BUILD_CUDA="0"
+.\.venv\Scripts\python.exe -m pip install --no-build-isolation sam2==1.1.0
+.\.venv\Scripts\python.exe -c "from PIL import Image; from app.sam_selection import segment; s = segment(Image.open('assets/room.png'), (0.3, 0.4, 0.7, 0.9), device='cuda'); print(len(s.polygons), s.score, s.bounds)"
+```
+
+Weights (`SAM_MODEL`, default `facebook/sam2.1-hiera-large`, ~900 MB) download
+from Hugging Face on first use. `SAM_DEVICE` forces a device; the photo
+embedding is cached per photo (`SAM_EMBEDDING_CACHE`, default 8).
+
 The generation route currently bypasses VGGT/compositing for testing in
 `app/generate_routes.py`; installing ROCm does not remove that bypass.
 
@@ -168,6 +182,7 @@ All but `/api/health` need `Authorization: Bearer <token from :8080/api/token>`.
 | POST | `http://localhost:5000/api/tokens/spend` | Debit `{"amount": N, "reason": "…"}` |
 | GET | `http://localhost:5000/api/generate/quote?references=0&images=1` | What that generation would cost |
 | POST | `http://localhost:5000/api/generate` | Queues a FLUX.2 generation; answers 202 `{jobId}` |
+| POST | `http://localhost:5000/api/segment_selection` | SAM 2.1 outline of the object in a box — synchronous, free |
 | GET | `http://localhost:5000/api/jobs/<jobId>` | Job status; cost and new balance once `done` |
 | GET | `http://localhost:5000/api/jobs/<jobId>/image` | The generated PNG |
 | GET | `http://localhost:5000/api/admin/health` | Example role gate, `ADMIN` only |

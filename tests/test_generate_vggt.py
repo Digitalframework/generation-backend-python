@@ -165,3 +165,48 @@ def test_bad_person_height_rejected_before_external_work(app, client, monkeypatc
     images.fetch.assert_not_called()
     reconstruction.assert_not_called()
     flux.generate.assert_not_called()
+
+
+def test_failed_multi_view_reconstruction_retries_with_main_photo(app, client, monkeypatch):
+    """Views of the far side of a room can leave VGGT without a floor in frame 0."""
+    geometry = SimpleNamespace(walls=[])
+    reconstruction = Mock(side_effect=[ValueError("too little confident depth"), geometry])
+    account, flux = Mock(), Mock()
+    account.get_balance.return_value = 100
+    account.spend.return_value = 90
+    image = Image.new("RGB", (32, 24), "purple")
+    flux.generate.return_value = image
+    monkeypatch.setattr(app.extensions["verifier"], "verify", lambda token: {})
+    monkeypatch.setattr(routes, "_client", lambda: account)
+    monkeypatch.setattr(routes, "_flux", lambda: flux)
+    monkeypatch.setattr(routes, "_images", lambda: SimpleNamespace(fetch=lambda *args: []))
+    monkeypatch.setattr(routes, "solve_scene", reconstruction)
+    monkeypatch.setattr(routes, "_catalogue_placements", lambda *args: [])
+    monkeypatch.setattr(routes, "compose", lambda *args: CompositeResult(
+        image, Image.new("L", image.size, 0)))
+    monkeypatch.setattr(routes, "build_prompt", lambda *args, **kwargs: "room prompt")
+    response = client.post("/api/generate", headers={"Authorization": "Bearer test"}, data={
+        "prompt": "furnish", "image_ids": "1",
+        "rooms": [(photo(c), f"room{i}.png") for i, c in enumerate(["red", "green", "blue"])],
+    })
+    assert response.status_code == 202
+    assert response.json["status"] == "done"
+    first, second = reconstruction.call_args_list
+    assert len(first.args[0]) == 3
+    assert len(second.args[0]) == 1
+    assert second.args[0][0].getpixel((0, 0)) == (255, 0, 0)
+
+
+def test_single_photo_reconstruction_failure_is_still_422(app, client, monkeypatch):
+    reconstruction = Mock(side_effect=ValueError("not a room"))
+    account = Mock()
+    account.get_balance.return_value = 100
+    monkeypatch.setattr(app.extensions["verifier"], "verify", lambda token: {})
+    monkeypatch.setattr(routes, "_client", lambda: account)
+    monkeypatch.setattr(routes, "_images", lambda: SimpleNamespace(fetch=lambda *args: []))
+    monkeypatch.setattr(routes, "solve_scene", reconstruction)
+    response = client.post("/api/generate/plan", headers={"Authorization": "Bearer test"},
+                           data={"image_ids": "1", "scene": (photo("red"), "room.png")})
+    assert response.status_code == 422
+    assert response.json["error"] == "scene_unsolvable"
+    assert reconstruction.call_count == 1
